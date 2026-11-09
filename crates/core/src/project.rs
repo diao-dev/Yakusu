@@ -108,6 +108,10 @@ pub struct ResultRow {
     pub before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_review: Option<String>,
+    /// Automatic fixes already attempted on this text ("fit:56x3",
+    /// "glossary:Sakura"), so a later run doesn't pay for the same attempt again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tried: Vec<String>,
     #[serde(default)]
     pub t: f64,
 }

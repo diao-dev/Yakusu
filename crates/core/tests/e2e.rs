@@ -275,3 +275,62 @@ fn quote_modes_and_box_settings_apply_at_build() {
         );
     }
 }
+
+/// A line the model's safety system won't translate is set aside; the rest
+/// of the game still gets translated, built and installed.
+#[test]
+fn declined_lines_do_not_stop_the_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = env(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    // The narration line of the second script.
+    let needle = "いつもより短く";
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c2 = calls.clone();
+    let factory = fake_with(Box::new(move |_s, u| {
+        let part = u.split_once("TRANSLATE").map(|x| x.1)?;
+        if part.contains(needle) {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Err(LlmError::Refused(Default::default())))
+        } else {
+            None
+        }
+    }));
+    let pipe = pipeline(&env, &game, settings("quick", 8, 1), factory);
+    let sum = pipe.run_all().unwrap();
+    assert!(sum.installed && sum.complete);
+    assert_eq!((sum.left, sum.declined), (1, 1));
+    let live = pipe.live_lines();
+    pipe.p.with_results(|res| {
+        for l in &live {
+            let r = res.get(&l.id).unwrap();
+            assert_eq!(r.good(), !l.jp.contains(needle), "{}", l.jp);
+        }
+    });
+    // A second run doesn't send the declined line again.
+    let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let sum = pipe.run_all().unwrap();
+    assert_eq!(sum.declined, 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before);
+}
+
+/// A model that spends its whole limit thinking is asked once more with room.
+#[test]
+fn a_reply_lost_to_thinking_is_asked_again_with_more_room() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = env(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let f2 = first.clone();
+    let factory = fake_with(Box::new(move |_s, u| {
+        if u.contains("TRANSLATE") && f2.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Some(Err(LlmError::NoRoom(Default::default())))
+        } else {
+            None
+        }
+    }));
+    let pipe = pipeline(&env, &game, settings("quick", 8, 1), factory);
+    pipe.extract().unwrap();
+    pipe.translate(None, false).unwrap();
+    pipe.p.with_results(|res| assert!(pipe.live_lines().iter().all(|l| res.get(&l.id).is_some_and(|r| r.good()))));
+}

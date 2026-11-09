@@ -121,13 +121,20 @@ pub enum LlmError {
     Fatal(String),
     /// The reply hit the token limit. The caller should split the work.
     Truncated(Usage),
+    /// The token limit was used up before any answer was written (a model
+    /// that thinks first spent it all on thinking). The caller should ask
+    /// again with more room.
+    NoRoom(Usage),
+    /// The provider's safety system declined to answer.
+    Refused(Usage),
 }
 
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LlmError::Fatal(m) => f.write_str(m),
-            LlmError::Truncated(_) => f.write_str("The reply was cut off by the length limit."),
+            LlmError::Truncated(_) | LlmError::NoRoom(_) => f.write_str("The reply was cut off by the length limit."),
+            LlmError::Refused(_) => f.write_str("The model declined to answer."),
         }
     }
 }
@@ -143,6 +150,12 @@ pub struct Completion {
 /// the dev server use [`fake::FakeLlm`].
 pub trait Llm: Send + Sync {
     fn model(&self) -> &str;
+    /// The output-token limit actually sent for a request asking for
+    /// `requested` tokens of answer: models that think before answering get
+    /// extra room, because thinking counts against the same limit.
+    fn max_output(&self, requested: u32) -> u32 {
+        requested
+    }
     fn complete(&self, system: &str, user: &str, max_tokens: u32, cancel: &AtomicBool) -> Result<Completion, LlmError>;
 }
 
@@ -160,11 +173,61 @@ enum Attempt {
     Transient(String, Option<f64>),
     BadRequest(String),
     Truncated(Usage),
+    NoRoom(Usage),
+    Refused(Usage),
 }
 
 struct OaParams {
     tokens_key: &'static str,
     temperature: bool,
+}
+
+/// How a Claude request keeps thinking out of the way. Translation batches
+/// don't need it, and thinking is billed as output and counts against
+/// `max_tokens`. Each model family turns it down differently; a request the
+/// API refuses moves one step along (see [`Think::next`]) and is sent again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Think {
+    /// `thinking: {"type": "disabled"}` (Haiku).
+    Disabled,
+    /// `thinking: {"type": "between_tools"}`: no thinking before the answer (Sonnet).
+    BetweenTools,
+    /// Thinking can't be turned off (Opus): ask for low effort, leave room.
+    LowEffort,
+    /// Send no thinking settings at all and leave room.
+    Default,
+}
+
+impl Think {
+    pub fn for_model(model: &str) -> Think {
+        let m = model.to_lowercase();
+        if m.contains("haiku") {
+            Think::Disabled
+        } else if m.contains("sonnet") {
+            Think::BetweenTools
+        } else {
+            Think::LowEffort
+        }
+    }
+
+    fn next(self) -> Option<Think> {
+        match self {
+            Think::Disabled => Some(Think::BetweenTools),
+            Think::BetweenTools => Some(Think::LowEffort),
+            Think::LowEffort => Some(Think::Default),
+            Think::Default => None,
+        }
+    }
+
+    /// The model may think before it answers.
+    fn thinks(self) -> bool {
+        matches!(self, Think::LowEffort | Think::Default)
+    }
+}
+
+/// Extra output tokens allowed when the model may think first.
+fn with_thinking_room(requested: u32) -> u32 {
+    requested.saturating_mul(2).saturating_add(4000).min(64_000)
 }
 
 pub struct Client {
@@ -178,6 +241,7 @@ pub struct Client {
     pub sleep: Box<dyn Fn(f64, &AtomicBool) + Send + Sync>,
     http: reqwest::blocking::Client,
     oa: Mutex<OaParams>,
+    think: Mutex<Think>,
 }
 
 impl Client {
@@ -206,7 +270,13 @@ impl Client {
                 tokens_key: if is_openai { "max_completion_tokens" } else { "max_tokens" },
                 temperature: !is_openai,
             }),
+            think: Mutex::new(Think::for_model(model)),
         }
+    }
+
+    /// The thinking setting in use (it adapts to what the API accepts).
+    pub fn think(&self) -> Think {
+        *self.think.lock().unwrap()
     }
 
     fn post(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value, Attempt> {
@@ -274,22 +344,54 @@ impl Client {
     }
 
     fn anthropic(&self, system: &str, user: &str, max_tokens: u32) -> Result<(String, Usage), Attempt> {
-        let body = json!({
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-            // Instructions + style sheet + glossary are the same for every batch: cached.
-            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            "messages": [{"role": "user", "content": user}],
-        });
         let headers = [("x-api-key", self.api_key.as_str()), ("anthropic-version", ANTHROPIC_VERSION)];
-        let data = match self.post(&self.base_url, &headers, &body) {
-            Err(Attempt::BadRequest(m)) => return Err(Attempt::Fatal(format!("The API refused the request: {m}"))),
-            r => r?,
-        };
+        let mut data = None;
+        // At most one request per thinking setting.
+        for _ in 0..4 {
+            let think = self.think();
+            // No sampling parameters: current Claude models reject `temperature`.
+            let mut body = json!({
+                "model": self.model,
+                "max_tokens": if think.thinks() { with_thinking_room(max_tokens) } else { max_tokens },
+                // Instructions + style sheet + glossary are the same for every batch: cached.
+                "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": user}],
+            });
+            match think {
+                Think::Disabled => body["thinking"] = json!({"type": "disabled"}),
+                Think::BetweenTools => body["thinking"] = json!({"type": "between_tools"}),
+                Think::LowEffort => body["output_config"] = json!({"effort": "low"}),
+                Think::Default => {}
+            }
+            match self.post(&self.base_url, &headers, &body) {
+                Ok(d) => {
+                    data = Some(d);
+                    break;
+                }
+                Err(Attempt::BadRequest(m)) => {
+                    // This model wants thinking set another way: move one
+                    // step along and send the request again.
+                    let low = m.to_lowercase();
+                    let about_thinking = low.contains("thinking") || low.contains("between_tools");
+                    let about_effort = low.contains("effort") || low.contains("output_config");
+                    let next = match think {
+                        Think::LowEffort if about_effort => Some(Think::Default),
+                        t if about_thinking && t != Think::LowEffort => t.next(),
+                        _ => None,
+                    };
+                    match next {
+                        Some(n) => *self.think.lock().unwrap() = n,
+                        None => return Err(Attempt::Fatal(format!("The API refused the request: {m}"))),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let data = data.ok_or_else(|| Attempt::Fatal("The API refused the request parameters.".into()))?;
         if data.get("type").and_then(Value::as_str) == Some("error") {
             return Err(Attempt::Transient(data.get("error").map(|e| e.to_string()).unwrap_or_default(), None));
         }
+        // Pick text blocks by type: a reply can start with thinking blocks.
         let text: String = data
             .get("content")
             .and_then(Value::as_array)
@@ -309,10 +411,14 @@ impl Client {
             cache_write: n("cache_creation_input_tokens"),
             cache_read: n("cache_read_input_tokens"),
         };
-        if data.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
-            return Err(Attempt::Truncated(usage));
+        match data.get("stop_reason").and_then(Value::as_str) {
+            Some("refusal") => Err(Attempt::Refused(usage)),
+            Some("max_tokens" | "model_context_window_exceeded") if text.trim().is_empty() => {
+                Err(Attempt::NoRoom(usage))
+            }
+            Some("max_tokens" | "model_context_window_exceeded") => Err(Attempt::Truncated(usage)),
+            _ => Ok((text, usage)),
         }
-        Ok((text, usage))
     }
 
     fn openai(&self, system: &str, user: &str, max_tokens: u32) -> Result<(String, Usage), Attempt> {
@@ -363,16 +469,27 @@ impl Client {
         let text = choice.pointer("/message/content").and_then(Value::as_str).unwrap_or("").to_string();
         let n = |k: &str| data.pointer(&format!("/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
         let usage = Usage { input: n("prompt_tokens"), output: n("completion_tokens"), cache_write: 0, cache_read: 0 };
-        if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
-            return Err(Attempt::Truncated(usage));
+        match choice.get("finish_reason").and_then(Value::as_str) {
+            Some("content_filter") => Err(Attempt::Refused(usage)),
+            // A reasoning model can spend the whole limit before it answers.
+            Some("length") if text.trim().is_empty() => Err(Attempt::NoRoom(usage)),
+            Some("length") => Err(Attempt::Truncated(usage)),
+            _ => Ok((text, usage)),
         }
-        Ok((text, usage))
     }
 }
 
 impl Llm for Client {
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn max_output(&self, requested: u32) -> u32 {
+        if self.kind == "anthropic" && self.think().thinks() {
+            with_thinking_room(requested)
+        } else {
+            requested
+        }
     }
 
     fn complete(&self, system: &str, user: &str, max_tokens: u32, cancel: &AtomicBool) -> Result<Completion, LlmError> {
@@ -387,6 +504,8 @@ impl Llm for Client {
             match r {
                 Ok((text, usage)) => return Ok(Completion { usd: cost_usd(&self.model, &usage), text, usage }),
                 Err(Attempt::Truncated(u)) => return Err(LlmError::Truncated(u)),
+                Err(Attempt::NoRoom(u)) => return Err(LlmError::NoRoom(u)),
+                Err(Attempt::Refused(u)) => return Err(LlmError::Refused(u)),
                 Err(Attempt::Fatal(m)) | Err(Attempt::BadRequest(m)) => return Err(LlmError::Fatal(m)),
                 Err(Attempt::Transient(m, retry_after)) => {
                     last = m;
@@ -401,6 +520,48 @@ impl Llm for Client {
         }
         Err(LlmError::Fatal(format!("Gave up after {} tries: {last}", self.max_attempts)))
     }
+}
+
+/// The model IDs a provider offers, for the model picker. For a local
+/// server this is whatever is loaded in LM Studio / Ollama.
+pub fn list_models(provider_id: &str, api_key: &str, base_url: Option<&str>) -> Result<Vec<String>, String> {
+    let p = provider(provider_id);
+    let base = base_url.filter(|b| !b.trim().is_empty()).unwrap_or(p.base_url).trim().trim_end_matches('/');
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Couldn't start the network client: {e}"))?;
+    let key = api_key.trim();
+    let req = if p.kind == "anthropic" {
+        let url = format!("{}/models?limit=100", base.trim_end_matches("/messages"));
+        http.get(url).header("x-api-key", key).header("anthropic-version", ANTHROPIC_VERSION)
+    } else {
+        let req = http.get(format!("{base}/models"));
+        if key.is_empty() {
+            req
+        } else {
+            req.header("authorization", format!("Bearer {key}"))
+        }
+    };
+    let resp = req.send().map_err(|e| {
+        if provider_id == "local" {
+            format!("Can't reach the local model at {base}. Start the server in LM Studio (Developer tab), then try again.")
+        } else {
+            format!("Couldn't reach {}: {e}", p.label)
+        }
+    })?;
+    let status = resp.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(format!("The API key was rejected ({status})."));
+    }
+    let v: Value = resp.json().map_err(|_| format!("{} sent an unreadable model list.", p.label))?;
+    let mut ids: Vec<String> = v
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|m| m.get("id").and_then(Value::as_str)).map(String::from).collect())
+        .unwrap_or_default();
+    ids.dedup();
+    Ok(ids)
 }
 
 static THINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
