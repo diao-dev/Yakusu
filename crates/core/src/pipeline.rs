@@ -97,7 +97,7 @@ pub fn client_for(s: &Settings, factory: &ClientFactory, model: &str) -> Result<
     let prov = s.provider.as_str();
     let key = s.key();
     if prov != "local" && key.is_empty() {
-        return setup("key", format!("Paste your {} API key first.", llm::provider(prov).label));
+        return setup("key", "Paste your API key first.");
     }
     if model.is_empty() {
         return setup(
@@ -597,6 +597,14 @@ impl Pipeline {
             .p
             .with_results(|r| live.iter().filter(|l| !r.get(&l.id).map(|x| x.translated()).unwrap_or(false)).count());
         let frac = if st.lines > 0 { todo as f64 / n } else { 1.0 };
+        // Lines the editor still has to see: untranslated ones and fresh translations.
+        let to_review = self.p.with_results(|r| {
+            live.iter().filter(|l| r.get(&l.id).is_none_or(|x| !x.translated() || x.stage == "translate")).count()
+        });
+        let rfrac = if st.lines > 0 { to_review as f64 / n } else { 1.0 };
+        // A model that can't stop thinking writes (and bills) more than the answer.
+        let thinks =
+            |m: &str| if self.s.provider == "anthropic" && llm::Think::for_model(m).thinks() { 1.6 } else { 1.0 };
         let (tm, rm) = self.models();
         let bs = self.s.batch_size.max(1) as f64;
         let ctx = self.s.context_lines as f64;
@@ -611,12 +619,12 @@ impl Pipeline {
         };
         let r4 = |x: f64| (x * 1e4).round() / 1e4;
         let range = |c: Option<f64>| c.map(|c| vec![r4(c), r4(c * 1.6)]);
-        let translate = range(cost(&tm, tr_in * frac, tr_out * frac, batches * frac));
+        let translate = range(cost(&tm, tr_in * frac, tr_out * thinks(&tm) * frac, batches * frac));
         let review = match &rm {
             Some(rm) => {
                 let rv_in = chars * 1.3 + chars * 0.62 + n * 30.0;
                 let rv_out = (chars * 0.62 + n * 12.0) * 0.4;
-                range(cost(rm, rv_in, rv_out, (n / 30.0).ceil()))
+                range(cost(rm, rv_in * rfrac, rv_out * thinks(rm) * rfrac, (n / 30.0).ceil() * rfrac))
             }
             None => Some(vec![0.0, 0.0]),
         };
@@ -867,7 +875,9 @@ impl Pipeline {
             }
             // One line the model won't touch: record it and move on. It
             // stays in Japanese until it's edited or retranslated.
-            Asked::Refused => return Ok(vec![self.row(&batch[0], "", client.model(), "translate", vec![DECLINED.into()])]),
+            Asked::Refused => {
+                return Ok(vec![self.row(&batch[0], "", client.model(), "translate", vec![DECLINED.into()])])
+            }
             Asked::Unusable => HashMap::new(),
         };
         let mut rows = Vec::new();

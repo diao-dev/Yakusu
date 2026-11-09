@@ -6,7 +6,7 @@
 
 <p align="center"><a href="../../releases/latest/download/Yakusu.exe"><b>Download Yakusu.exe</b></a> · Windows 10/11 · one file, nothing to install</p>
 
-![Yakusu's text box preview](docs/screenshot.png)
+![Yakusu: pick the game, paste a key, translate](docs/screenshot.png)
 
 ## Install
 
@@ -16,23 +16,25 @@
 
 **Update:** download the new `Yakusu.exe` and replace the old one. Projects, keys and settings carry over.
 
-**Uninstall:** in Yakusu, *Restore* any game you patched, then delete `Yakusu.exe` and the `%LOCALAPPDATA%\Yakusu` folder.
+**Uninstall:** in Yakusu, *Remove the patch* from any game you patched, then delete `Yakusu.exe` and the `%LOCALAPPDATA%\Yakusu` folder.
 
 Windows 10 or 11 (64-bit). It uses the Edge WebView2 runtime that Windows already includes.
 
 ## How to use it
 
-1. **Pick the game folder.** Yakusu recognises the engine and reads the script.
-2. **Paste an API key** (Claude, OpenAI, OpenRouter, or a free local model) and see the cost before anything is spent.
-3. **Make a test patch** of 150 lines, check it in the game, then **translate the rest**.
+1. **Pick the game folder.** Yakusu recognises the engine and reads the script by itself.
+2. **Paste an API key** (Claude, OpenAI, OpenRouter, or a free local model). The cost is shown before anything is spent.
+3. **Press *Translate the game*.** Yakusu works out the names and tone, translates, has a second model edit every line, shortens what won't fit the text box, then builds and installs the patch. Stop whenever you like; it picks up where it left off.
 
-Restore puts the original game back, byte for byte.
+Not sure yet? *Try 150 lines first* installs a small test patch to check in the game. *Remove the patch* puts the original game back, byte for byte.
+
+Everything else is optional: edit the style sheet and names, adjust the text box, or proofread lines one by one.
 
 ## What it handles
 
-- **Engines:** Kirikiri (including ~500 encrypted games), FAVORITE, Artemis, BGI, YU-RIS, QLiE, Circus, Escu:de, plus CatSystem2 and Softpal with one manual step. Anything else works through *Translate extracted script files*.
-- **Quality:** a style sheet and name glossary every batch follows, an optional review pass by a stronger model, and a pass that rewrites lines too long for the game's text box.
-- **Safety:** game codes are protected and checked on every line, and checked again right before the patch is written, so a model can't slip a command into the game. Archives can't write outside their folder, backups of the originals are never overwritten, Restore checks every backup before touching the game, and a failed re-read keeps the previous one. Progress is saved as it goes (stop any time).
+- **Engines:** Kirikiri (including ~500 encrypted games), FAVORITE, Artemis, BGI, YU-RIS, QLiE, Circus, Escu:de, plus CatSystem2 and Softpal with one manual step. Anything else works through *Use extracted script files instead*.
+- **Quality:** a style sheet and name glossary every batch follows, a review pass by a stronger model, and a pass that rewrites lines too long for the game's text box. All of it runs from the one button.
+- **Safety:** game codes are protected and checked on every line, and checked again right before the patch is written, so a model can't slip a command into the game. Archives can't write outside their folder, backups of the originals are never overwritten, removing a patch checks every backup before touching the game, and a failed re-read keeps the previous one. Progress is saved as it goes (stop any time).
 - **Spending limit:** set a cap and Yakusu stops before a request could cross it. For models it has no price for, enter the price in Settings; it won't run a capped job it can't count.
 - **Proofreading:** search and edit every line, or export a CSV and import it back.
 

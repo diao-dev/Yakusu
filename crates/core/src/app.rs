@@ -540,20 +540,31 @@ impl App {
         Ok(json!({"ok": true}))
     }
 
-    /// For a local server, use the model that's loaded when none was typed in.
-    fn ensure_local_model(&self) {
+    /// For a local server, use the model that's loaded when none was typed
+    /// in. Says what to do when the server isn't running or has no model.
+    fn ensure_local_model(&self) -> Result<()> {
         let s = self.settings();
         if s.provider != "local" || s.translate_model.get("local").is_some_and(|m| !m.trim().is_empty()) {
-            return;
+            return Ok(());
         }
         let base = s.base_urls.get("local").map(String::as_str);
-        let Ok(models) = llm::list_models("local", "", base) else { return };
-        let Some(first) = models.into_iter().find(|m| !m.to_lowercase().contains("embed")) else { return };
+        let models = match llm::list_models("local", "", base) {
+            Ok(m) => m,
+            Err(e) => return Err(Error::Setup { need: "model", msg: e }),
+        };
+        let Some(first) = models.into_iter().find(|m| !m.to_lowercase().contains("embed")) else {
+            return Err(Error::Setup {
+                need: "model",
+                msg: "The local server is running but has no model loaded. Load one in LM Studio, then try again."
+                    .into(),
+            });
+        };
         let mut i = self.inner.lock().unwrap();
         i.settings.translate_model.insert("local".into(), first.clone());
         let _ = self.env.save_settings(&i.settings);
         drop(i);
         self.log(&format!("Using the local model {first}."));
+        Ok(())
     }
 
     /// The models the current provider offers (for the model picker).
@@ -634,7 +645,7 @@ impl App {
 
     /// Check that the saved key and model answer a request.
     fn test_key(&self) -> Result<Value> {
-        self.ensure_local_model();
+        self.ensure_local_model()?;
         let s = self.settings();
         let (tm, _) = pipeline::models_for(&s);
         let client = pipeline::client_for(&s, &self.factory, &tm)?;
@@ -854,7 +865,7 @@ impl App {
             return user("Something is already running. Wait for it or press Stop.");
         }
         if !matches!(action, "extract" | "build" | "refit" | "restore") {
-            self.ensure_local_model();
+            self.ensure_local_model()?;
         }
         let pipe = self.pipeline()?;
         let app = self.clone();
@@ -902,7 +913,7 @@ impl App {
         if ids.is_empty() {
             return user("Pick at least one line.");
         }
-        self.ensure_local_model();
+        self.ensure_local_model()?;
         let pipe = self.pipeline()?;
         let installed = pipe.installed();
         let app = self.clone();
@@ -933,6 +944,8 @@ impl App {
                     Pipeline::new(self.env.clone(), p.clone(), s, self.factory.clone()).estimate(),
                 );
             }
+            // And for the settings as they are (any provider).
+            out.insert("current".into(), self.pipeline()?.estimate());
             return Ok(Value::Object(out));
         }
         Ok(self.pipeline()?.estimate())

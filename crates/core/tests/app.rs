@@ -58,7 +58,7 @@ fn flow_through_commands() {
     assert!(st["job"]["error"].is_null(), "{}", st["job"]);
     let est = call(&a, "estimate", json!({"all": true}));
     let keys: Vec<&String> = est.as_object().unwrap().keys().collect();
-    assert_eq!(keys.len(), 3);
+    assert_eq!(keys.len(), 4); // the three presets and "current"
     assert!(est["recommended"]["total"][0].as_f64().unwrap() > est["quick"]["total"][0].as_f64().unwrap());
     assert!(call(&a, "preflight", json!({}))["notes"].is_array());
 
@@ -261,7 +261,8 @@ fn one_click_reads_the_scripts_when_needed() {
         let p = yakusu_core::project::Project::for_game(&env(tmp.path()), &game).unwrap();
         let m = yakusu_core::engines::detect(&game).unwrap().remove(0);
         p.update_meta(|meta| meta.engine = Some(m)).unwrap();
-        let mut s = yakusu_core::config::Settings { last_game: Some(game.to_string_lossy().into()), ..Default::default() };
+        let mut s =
+            yakusu_core::config::Settings { last_game: Some(game.to_string_lossy().into()), ..Default::default() };
         s.keys.insert("anthropic".into(), "k".into());
         env(tmp.path()).save_settings(&s).unwrap();
     }

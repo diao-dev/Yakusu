@@ -16,7 +16,10 @@ pub enum Error {
     /// Something has to be set up before this can run. `need` says what, so
     /// the interface can put the right control in front of the user:
     /// "key" (API key), "model" (model name), "title" (which Kirikiri game).
-    Setup { need: &'static str, msg: String },
+    Setup {
+        need: &'static str,
+        msg: String,
+    },
     /// A model reply hit the length limit (internal: the caller splits the work).
     Truncated,
     /// The model's safety system declined (internal: the caller splits the work).

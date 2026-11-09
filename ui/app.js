@@ -7,13 +7,27 @@
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
   let S = null;              // last state
-  let view = 'game';
+  let view = 'home';
   let previewLines = [];
   let previewIdx = 0;
   let previewBox = null;
   const linesState = { filter: 'all', q: '', page: 0 };
   let estimates = null;
   let keptShownFor = null;
+  let translatorOpen = false;   // the translator card is expanded by hand
+  let keyStatus = null;         // { cls, text } under the API key field
+  let titlePickOpen = false;    // choosing which Kirikiri game this is
+  const modelLists = {};        // provider -> model IDs it offers
+
+  // Cards are rebuilt only when what they show changes, so a click is never
+  // lost to a redraw and typing is never interrupted.
+  const drawn = {};
+  function changed(key, data) {
+    const sig = JSON.stringify(data);
+    if (drawn[key] === sig) return false;
+    drawn[key] = sig;
+    return true;
+  }
 
   // ------------------------------------------------------------ bridge
   async function call(cmd, args = {}) {
@@ -37,6 +51,7 @@
       const p = await TAURI.dialog.open({ directory: true, multiple: false, title });
       return Array.isArray(p) ? p[0] : p;
     }
+    if (view !== 'home') show('home');
     $('#gamePath').focus();
     toast('Paste the folder path into the box and press Open.');
     return null;
@@ -116,7 +131,7 @@
     $$('.rail [data-view]').forEach((b) => { if (b.dataset.view !== v) b.removeAttribute('aria-current'); else b.setAttribute('aria-current', 'page'); });
     $('#main').scrollTop = 0;
     if (S) render();
-    if (v === 'translator' || v === 'run') loadEstimates();
+    if (v === 'home') loadEstimates();
     if (v === 'style') loadStyle();
     if (v === 'test') loadPreview();
     if (v === 'lines') loadLines();
@@ -129,41 +144,53 @@
   async function refresh() {
     try { S = await call('state'); } catch (e) { return; }
     render();
-    const fin = S.job && S.job.finished;
-    if (lastFinished !== undefined && fin && fin !== lastFinished) onJobDone();
-    lastFinished = fin || null;
+    const j = S.job || {};
+    const fin = j.finished;
+    if (lastFinished !== undefined && !j.running && fin && fin !== lastFinished) onJobDone();
+    if (!j.running) lastFinished = fin || null;
+    else if (lastFinished === undefined) lastFinished = null;
   }
-  function loop() { refresh().finally(() => setTimeout(loop, (S && S.job && S.job.running) ? 700 : 2500)); }
+  function loop() { refresh().finally(() => setTimeout(loop, (S && S.job && S.job.running) ? 600 : 2500)); }
 
+  const DONE_MSG = { extract: 'Scripts read.', style: 'Style sheet drafted.', refit: 'Applied to the game.',
+    restore: 'Original game restored.', build: 'Patch rebuilt and installed.', glossary: 'Name spellings fixed.',
+    retranslate: 'Lines retranslated.', translate: 'Translation saved.', review: 'Review finished.', fit: 'Long lines shortened.' };
   function onJobDone() {
     const j = S.job;
-    if (j.error) toast(j.error, true);
-    else if (j.stopped) toast('Stopped. Progress is saved.');
-    else toast(({ extract: 'Scripts read.', style: 'Style sheet drafted.', test: 'Test patch installed. Launch the game to check it.',
-      refit: 'Applied to the game.', full: 'Translation installed.', restore: 'Original game restored.',
-      build: 'Patch rebuilt and installed.', glossary: 'Name spellings fixed.', retranslate: 'Lines retranslated.',
-      translate: 'Translation saved.', review: 'Review finished.', fit: 'Long lines shortened.' })[j.action] || 'Done.');
-    if (!j.error && !j.stopped && j.result && j.result.complete) showKept(j.result.applied);
+    if (j.need) needSetup(j.need, j.error);
+    else if (j.error) toast(j.error, true);
+    else if (j.stopped) toast('Stopped. Everything translated so far is saved.');
+    else if (j.action === 'auto') toast(j.result && j.result.installed ? 'Translation installed. Launch the game!' : 'Translation finished.');
+    else if (j.action === 'test') toast(j.result && j.result.installed ? 'Test patch installed. Launch the game to check it.' : 'Test lines translated.');
+    else toast(DONE_MSG[j.action] || 'Done.');
+    if (!j.error && !j.stopped && j.result && j.result.complete) showKept(j.result);
+    estimates = null;
+    loadEstimates();
     if (view === 'style') loadStyle();
     if (view === 'test') loadPreview();
-    if (view === 'run' || view === 'translator') loadEstimates();
     if (view === 'lines') loadLines();
+  }
+
+  // Something has to be set up before the job can run: put that control in
+  // front of the user instead of only reporting an error.
+  function needSetup(need, msg) {
+    if (need === 'key' || need === 'model') {
+      translatorOpen = true;
+      if (need === 'key') keyStatus = { cls: 'bad', text: msg };
+      show('home');
+      const el = $(need === 'key' ? '#apiKey' : '#tmodel') || $('#apiKey');
+      if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); }
+    } else if (need === 'title') {
+      titlePickOpen = true;
+      show('home');
+    }
+    toast(msg, true);
   }
 
   // ------------------------------------------------------------ render
   function render() {
     const p = S.project;
     $('#railGame').textContent = p ? p.name : 'No game open';
-    const done = {
-      game: p && p.extracted,
-      translator: S.settings.keys && (S.settings.keys[S.settings.provider] || S.settings.provider === 'local'),
-      style: p && p.has_style,
-      test: p && (p.built_at || p.translated > 0),
-      run: p && p.total && p.translated >= p.total && p.installed,
-    };
-    const btns = $$('.steps button');
-    btns.forEach((b) => b.classList.toggle('done', !!done[b.dataset.view]));
-    drawThread(btns.map((b) => !!done[b.dataset.view]));
     const foot = $('#railFoot');
     foot.replaceChildren();
     if (p && p.extracted) {
@@ -171,29 +198,20 @@
       foot.append(h('div', null, h('b', null, money(p.spent)), ' spent'));
       if (p.installed) foot.append(h('div', { class: 'installed', text: 'Patch installed' }));
     }
+    const np = $('#navProblems');
+    np.hidden = !(p && p.problems);
+    np.textContent = p && p.problems ? num(p.problems) : '';
+    $('#versionLine').textContent = S.version ? `Yakusu ${S.version}` : '';
     renderJob();
-    renderGame();
-    renderTranslator();
+    renderHome();
+    renderSettings();
     renderTest();
-    renderRun();
     if (view === 'activity') renderLog();
   }
 
-  // The thread runs from the first knot down through every kept step.
-  function drawThread(done) {
-    let last = -1;
-    for (let i = 0; i < done.length; i++) { if (done[i]) last = i; else break; }
-    const btns = $$('.steps button');
-    const fill = $('#threadFill');
-    if (last < 0) { fill.style.height = '0px'; return; }
-    const top = btns[0].querySelector('.knot').getBoundingClientRect().top;
-    const knot = btns[Math.min(last + (last < done.length - 1 ? 1 : 0), done.length - 1)].querySelector('.knot').getBoundingClientRect();
-    fill.style.height = `${Math.max(0, knot.top + knot.height / 2 - top - 10)}px`;
-  }
-
-  const STAGE = { extract: 'Reading scripts', style: 'Drafting the style sheet', translate: 'Translating', review: 'Reviewing',
-    fit: 'Fitting text', build: 'Building the patch', test: 'Test patch', full: 'Translating', refit: 'Building the patch', restore: 'Restoring',
-    glossary: 'Glossary check', names: 'Naming speakers', retranslate: 'Retranslating' };
+  const STAGE = { extract: 'Reading the scripts', style: 'Writing the style sheet', translate: 'Translating', review: 'Reviewing',
+    fit: 'Fitting text to the box', build: 'Building the patch', test: 'Test patch', auto: 'Getting ready', refit: 'Building the patch',
+    restore: 'Restoring', glossary: 'Checking name spellings', names: 'Naming the characters', retranslate: 'Retranslating' };
   function renderJob() {
     const j = S.job || {};
     $('#jobbar').hidden = !j.running;
@@ -232,23 +250,25 @@
 
   // A failed job leaves a banner until dismissed, with a way to try again.
   let bannerDismissed = null;
-  const RETRYABLE = ['extract', 'style', 'test', 'refit', 'full', 'translate', 'review', 'fit', 'build', 'restore', 'glossary'];
+  const RETRYABLE = ['extract', 'style', 'test', 'refit', 'auto', 'translate', 'review', 'fit', 'build', 'restore', 'glossary'];
   function renderBanner() {
     const j = S.job || {};
-    const showIt = !j.running && j.error && bannerDismissed !== j.finished;
+    // The game's own card explains a failed read; setup problems open their control.
+    const showIt = !j.running && j.error && bannerDismissed !== j.finished && j.need !== 'title';
     $('#banner').hidden = !showIt;
     if (!showIt) return;
-    $('#bannerTitle').textContent = ({ extract: 'Couldn\'t read the scripts', style: 'Couldn\'t draft the style sheet',
-      test: 'The test patch didn\'t finish', full: 'Translation stopped', translate: 'Translation stopped', review: 'Review stopped',
-      build: 'Couldn\'t build the patch', refit: 'Couldn\'t apply the changes', restore: 'Couldn\'t restore the game' })[j.action] || 'Something went wrong';
-    $('#bannerMsg').textContent = j.error;
-    $('#bannerRetry').hidden = !RETRYABLE.includes(j.action);
+    $('#bannerTitle').textContent = j.need === 'key' ? 'An API key is needed' : j.need === 'model' ? 'A model is needed' :
+      ({ extract: 'Couldn\'t read the scripts', style: 'Couldn\'t write the style sheet',
+        test: 'The test patch didn\'t finish', auto: 'Translation stopped', translate: 'Translation stopped', review: 'Review stopped',
+        build: 'Couldn\'t build the patch', refit: 'Couldn\'t apply the changes', restore: 'Couldn\'t restore the game' })[j.action] || 'Something went wrong';
+    $('#bannerMsg').textContent = j.error + (j.action === 'auto' && !j.need ? ' Everything translated so far is saved: press Try again to pick up where it stopped.' : '');
+    $('#bannerRetry').hidden = !RETRYABLE.includes(j.action) || !!j.need;
   }
   $('#bannerClose').addEventListener('click', () => { bannerDismissed = S.job.finished; renderBanner(); });
   $('#bannerLog').addEventListener('click', () => show('activity'));
   $('#bannerRetry').addEventListener('click', () => { bannerDismissed = S.job.finished; run(S.job.action); });
 
-  // ------------------------------------------------------------ 1. game
+  // ------------------------------------------------------------ the game
   $('#browseGame').addEventListener('click', () => safe(async () => {
     const p = await pickFolder('Choose the game folder');
     if (p) await openGame(p);
@@ -262,8 +282,10 @@
     await call('open', { game_dir: path });
     $('#gamePath').value = '';
     estimates = null;
+    titlePickOpen = false;
+    $('#kept').replaceChildren();
     await refresh();
-    show('game');
+    show('home');
   }
   const picker = $('#picker');
   if (TAURI && TAURI.webview) {
@@ -272,23 +294,37 @@
       const t = ev.payload.type;
       if (t === 'enter' || t === 'over') picker.classList.add('drag');
       else picker.classList.remove('drag');
-      if (t === 'drop' && ev.payload.paths && ev.payload.paths[0]) { show('game'); safe(() => openGame(ev.payload.paths[0])); }
+      if (t === 'drop' && ev.payload.paths && ev.payload.paths[0]) safe(() => openGame(ev.payload.paths[0]));
     });
   } else {
     ['dragenter', 'dragover'].forEach((ev) => picker.addEventListener(ev, (e) => { e.preventDefault(); picker.classList.add('drag'); }));
     ['dragleave', 'drop'].forEach((ev) => picker.addEventListener(ev, () => picker.classList.remove('drag')));
     picker.addEventListener('drop', (e) => { e.preventDefault(); toast('The browser doesn\'t share folder paths. Paste the path instead.', true); });
   }
-  // Pasting a path anywhere on the Game step opens it.
+  // Pasting a path anywhere on the Translate page opens it.
   document.addEventListener('paste', (e) => {
-    if (view !== 'game' || /^(INPUT|TEXTAREA)$/.test((document.activeElement || {}).tagName || '')) return;
+    if (view !== 'home' || /^(INPUT|TEXTAREA)$/.test((document.activeElement || {}).tagName || '')) return;
     const t = (e.clipboardData.getData('text') || '').trim().replace(/^"|"$/g, '');
     if (/^([A-Za-z]:[\\/]|\/|\\\\)/.test(t)) { $('#gamePath').value = t; safe(() => openGame(t)); }
   });
 
+  function renderHome() {
+    const p = S.project;
+    $('#home').classList.toggle('has-game', !!p);
+    $('#homeTitle').textContent = p ? p.name : 'Translate a visual novel';
+    $('#homeLead').hidden = !!p;
+    picker.classList.toggle('compact', !!p);
+    $('#browseGame').textContent = p ? 'Open another game' : 'Choose game folder';
+    renderGame();
+    renderTranslator();
+    renderRun();
+    renderRecent();
+  }
+
   function renderRecent() {
-    const box = $('#recent');
     const items = S.recent || [];
+    if (!changed('recent', [items, !!S.project])) return;
+    const box = $('#recent');
     if (!items.length) { box.replaceChildren(); return; }
     box.replaceChildren(h('div', { class: 'recent' }, h('h2', { text: S.project ? 'Other games' : 'Recent games' }),
       h('ul', null, items.map((r) => h('li', { class: r.exists ? '' : 'missing' },
@@ -311,15 +347,18 @@
   function stat(v, l) { return h('div', { class: 'stat' }, h('b', { text: v }), h('span', { text: l })); }
 
   function renderGame() {
-    const box = $('#detectResult');
+    const box = $('#gameCard');
     const p = S.project;
-    renderRecent();
-    picker.classList.toggle('compact', !!p);
-    $('#browseGame').textContent = p ? 'Open another game' : 'Choose game folder';
-    if (!p) { box.replaceChildren(); return; }
-    if (isTyping(box)) return;
+    if (!p) { if (changed('game', null)) box.replaceChildren(); return; }
+    const j = S.job || {};
     const eng = p.engine;
-    const card = h('div', { class: 'detect' });
+    const det = (eng && eng.details) || {};
+    const reading = j.running && j.action === 'extract';
+    const readError = !j.running && j.action === 'extract' && j.error ? j.error : null;
+    const needTitle = eng && eng.engine_id === 'kirikiri' && (titlePickOpen || (!j.running && j.need === 'title'));
+    if (isTyping(box)) return;
+    if (!changed('game', [p.game_dir, eng, p.stats, p.box, p.extracted, S.matches, reading, readError, needTitle])) return;
+    const card = h('div', { class: 'card detect' });
     card.append(h('div', { class: 'detect-head' },
       h('div', null, h('h2', { text: eng ? eng.name : 'Engine not recognised' }), h('div', { class: 'path', text: p.game_dir })),
       eng ? supportBadge(eng.support) : null));
@@ -329,46 +368,44 @@
       card.append(h('p', { class: 'note', text: u ? `${u.name}: ${u.note}` :
         'Yakusu didn\'t recognise this game\'s engine. If you have its script files extracted (for example with GARbro), translate them directly.' }));
     }
-    const others = S.matches.filter((m) => eng && m.engine_id !== eng.engine_id && m.engine_id !== 'unsupported');
-    if (others.length) {
-      card.append(h('div', { class: 'alt-list' }, h('span', { class: 'hint', text: 'Also possible:' }),
-        others.map((m) => h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => { await call('engine', { engine_id: m.engine_id }); refresh(); }) }, `Use ${m.name}`))));
-    }
-    const det = (eng && eng.details) || {};
-    if (eng && eng.engine_id === 'kirikiri' && (S.job.error || '').includes('encrypted') && !det.xp3_title) {
-      card.append(titlePicker());
+    if (needTitle) {
+      card.append(titlePicker(!!det.xp3_title));
     } else if (eng && eng.engine_id === 'kirikiri' && det.xp3_title) {
       card.append(h('p', { class: 'note' }, `Encrypted archives, decrypted with the profile for “${det.xp3_title}”. `,
-        h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => { await call('engine', { xp3_title: '' }); refresh(); }) }, 'Change')));
+        h('button', { class: 'btn btn-quiet', onclick: () => { titlePickOpen = true; render(); } }, 'Change')));
     }
-    const actions = h('div', { class: 'row-actions' });
-    if (eng && eng.engine_id !== 'unsupported') {
-      actions.append(h('button', { class: p.extracted ? 'btn' : 'btn btn-primary', onclick: () => run('extract') }, p.extracted ? 'Read the scripts again' : 'Read the scripts'));
+    if (reading) {
+      card.append(h('p', { class: 'note reading', role: 'status', text: 'Reading the scripts… this takes a moment for big games.' }));
+    } else if (readError && !needTitle) {
+      card.append(h('div', { class: 'callout bad' }, h('b', { text: 'Couldn\'t read the scripts. ' }), readError));
     }
-    actions.append(h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
-      const path = await pickFolder('Choose the folder with the extracted script files');
-      if (path) { await call('engine', { scripts_folder: path }); refresh(); }
-    }) }, 'Translate extracted script files instead'));
-    card.append(actions);
-    if (p.stats) {
+    if (p.stats && !reading) {
       const st = p.stats;
       card.append(h('div', { class: 'stats' },
         stat(num(st.lines), 'lines to translate'),
         stat(num(st.files), 'script files'),
         stat(num(st.jp_chars), 'Japanese characters'),
         stat(p.box ? `${p.box.width} × ${p.box.lines}` : '—', 'text box size')));
-      if (st.speakers && st.speakers.length) {
-        card.append(h('div', { class: 'speakers' }, st.speakers.slice(0, 24).map(([n, c]) => h('span', { lang: 'ja' }, n, h('em', { text: num(c) })))));
-      }
-      card.append(h('div', { class: 'row-actions' }, h('button', { class: 'btn btn-primary', onclick: () => show('translator') }, 'Next: choose the translator')));
     }
+    // Ways out when the automatic reading isn't right.
+    const others = S.matches.filter((m) => eng && m.engine_id !== eng.engine_id && m.engine_id !== 'unsupported');
+    const tools = h('div', { class: 'alt-list' });
+    if (eng && eng.engine_id !== 'unsupported' && !reading) {
+      tools.append(h('button', { class: p.extracted ? 'btn btn-quiet' : 'btn btn-primary', onclick: () => run('extract') }, p.extracted ? 'Read the scripts again' : 'Read the scripts'));
+    }
+    others.forEach((m) => tools.append(h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => { await call('engine', { engine_id: m.engine_id }); refresh(); }) }, `Read as ${m.name}`)));
+    tools.append(h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
+      const path = await pickFolder('Choose the folder with the extracted script files');
+      if (path) { await call('engine', { scripts_folder: path }); refresh(); }
+    }) }, 'Use extracted script files instead'));
+    card.append(tools);
     box.replaceChildren(card);
   }
 
-  function titlePicker() {
+  function titlePicker(hasTitle) {
     const wrap = h('div', { class: 'title-pick' },
-      h('b', { text: 'This game\'s archives are encrypted. Which game is it?' }),
-      h('p', { class: 'hint', text: 'Yakusu knows the encryption of about 500 Kirikiri games. Search by English or Japanese title.' }));
+      h('b', { text: hasTitle ? 'Which game is this?' : 'This game\'s archives are encrypted. Which game is it?' }),
+      h('p', { class: 'hint', text: 'Yakusu knows the encryption of about 500 Kirikiri games. Search by English or Japanese title, then pick the exact game and edition.' }));
     const input = h('input', { class: 'input', type: 'search', placeholder: 'Search titles', 'aria-label': 'Search game titles' });
     const list = h('ul');
     let t;
@@ -376,7 +413,11 @@
     async function search() {
       const r = await call('xp3_games', { q: input.value.trim() });
       list.replaceChildren(...r.games.map((g) => h('li', null, h('button', { onclick: () => safe(async () => {
-        await call('engine', { xp3_title: g.name }); toast(`Using the profile for ${g.name}.`); run('extract');
+        titlePickOpen = false;
+        // Setting the title reads the scripts again with that profile.
+        await call('engine', { xp3_title: g.name });
+        toast(`Using the profile for ${g.name}.`);
+        refresh();
       }) }, g.name, g.title ? h('span', { class: 'hint', text: '  ' + g.title }) : null))));
     }
     wrap.append(input, list);
@@ -384,121 +425,324 @@
     return wrap;
   }
 
-  // ------------------------------------------------------------ 2. translator
-  function renderTranslator() {
-    if (view !== 'translator') return;
-    if (isTyping($('section[data-view="translator"]'))) return;
+  // ------------------------------------------------------------ the translator
+  const modelOf = (s, which) => ((s[which] || {})[s.provider] || '').trim();
+  function translatorReady() {
     const s = S.settings;
-    $('#providerSeg').replaceChildren(...Object.entries(S.providers).map(([id, p]) => h('button', {
-      'aria-pressed': String(s.provider === id), role: 'radio', 'aria-checked': String(s.provider === id),
-      onclick: () => safe(async () => { await call('settings', { provider: id }); estimates = null; await refresh(); loadEstimates(); }),
-    }, p.label)));
-    const prov = S.providers[s.provider];
-    const f = $('#providerFields');
-    f.replaceChildren();
-    if (s.provider !== 'local') {
-      const key = h('input', { class: 'input', type: 'password', id: 'apiKey', autocomplete: 'off', spellcheck: 'false',
-        placeholder: s.keys[s.provider] ? `Saved (${s.keys[s.provider]}). Paste a new key to replace it.` : `Paste your key (${prov.key_hint})` });
-      const status = h('div', { class: 'key-status' });
-      const save = h('button', { class: 'btn', onclick: () => safe(async () => {
-        if (key.value.trim()) await call('settings', { provider: s.provider, api_key: key.value.trim() });
-        key.value = '';
-        status.className = 'key-status'; status.textContent = 'Checking the key…';
-        try { const r = await call('test_key'); status.className = 'key-status ok'; status.textContent = `The key works (${r.model}).`; }
-        catch (e) { status.className = 'key-status bad'; status.textContent = e.message; }
-        refresh();
-      }) }, 'Save and test');
-      key.addEventListener('keydown', (e) => { if (e.key === 'Enter') save.click(); });
-      f.append(h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'apiKey', text: 'API key' }),
-        h('div', { class: 'key-row' }, key, save),
-        prov.key_url ? h('p', { class: 'hint' }, 'Get a key at ', h('a', { href: prov.key_url, target: '_blank', rel: 'noopener', text: prov.key_url.replace('https://', '') }), '. It\'s stored only on this computer.') : null,
-        status));
-    }
-    if (s.provider !== 'anthropic') {
-      const tm = h('input', { class: 'input', id: 'tmodel', value: (s.translate_model || {})[s.provider] || '', placeholder: s.provider === 'local' ? 'Model name as shown in LM Studio' : 'Model ID from your provider' });
-      const rm = h('input', { class: 'input', id: 'rmodel', value: (s.review_model || {})[s.provider] || '', placeholder: 'Optional: a stronger model for the review pass' });
-      const bu = h('input', { class: 'input', id: 'burl', value: (s.base_urls || {})[s.provider] || prov.base_url });
-      const saveModels = () => safe(async () => { await call('settings', { provider: s.provider, translate_model: tm.value, review_model: rm.value, base_url: bu.value, review: !!rm.value.trim() }); toast('Saved.'); refresh(); });
-      [tm, rm, bu].forEach((x) => x.addEventListener('change', saveModels));
-      // Paid providers: the price per million tokens, for estimates and the spending limit.
-      const priceRow = (model, id) => {
-        const cur = (s.prices || {})[model] || [];
-        const pin = h('input', { class: 'input', id: id + 'In', inputmode: 'decimal', value: cur[0] ?? '', placeholder: 'Input', 'aria-label': `${model} input price, USD per million tokens` });
-        const pout = h('input', { class: 'input', id: id + 'Out', inputmode: 'decimal', value: cur[1] ?? '', placeholder: 'Output', 'aria-label': `${model} output price, USD per million tokens` });
-        const save = () => safe(async () => {
-          const both = pin.value.trim() !== '' && pout.value.trim() !== '';
-          await call('settings', { prices: { [model]: both ? [pin.value, pout.value] : null } });
-          toast('Saved.'); refresh();
-        });
-        [pin, pout].forEach((x) => x.addEventListener('change', save));
-        return h('div', { class: 'price-row' }, h('span', { class: 'hint', text: 'Price in $ per million tokens: input, output' }), h('div', { class: 'two' }, pin, pout));
-      };
-      const tmName = ((s.translate_model || {})[s.provider] || '').trim();
-      const rmName = ((s.review_model || {})[s.provider] || '').trim();
-      f.append(h('div', { class: 'two' },
-        h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'tmodel', text: 'Translation model' }), tm,
-          s.provider !== 'local' && tmName ? priceRow(tmName, 'tprice') : null),
-        h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'rmodel', text: 'Review model' }), rm,
-          s.provider !== 'local' && rmName ? priceRow(rmName, 'rprice') : null)),
-        h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'burl', text: 'API address' }), bu,
-          h('p', { class: 'hint', text: s.provider === 'local' ? 'Start the local server in LM Studio (Developer tab) first. Local models are free but slower, and quality depends on the model.' : 'Enter each model\'s price (from your provider\'s pricing page) to see cost estimates and use a spending limit. Without a price, a run with a spending limit won\'t start.' })));
-    }
-    $('#presetGroup').hidden = s.provider !== 'anthropic';
-    renderPresets();
-    renderAdvanced();
-    const b = $('#budget');
-    if (document.activeElement !== b) b.value = s.budget_usd || '';
+    if (s.provider === 'local') return true;            // the loaded model is found when the run starts
+    if (!s.keys[s.provider]) return false;
+    return s.provider === 'anthropic' || !!modelOf(s, 'translate_model');
   }
+  function translatorSummary() {
+    const s = S.settings;
+    const prov = S.providers[s.provider];
+    const bits = [prov.label];
+    if (s.provider === 'anthropic') bits.push((S.presets[s.preset] || {}).label || s.preset);
+    else bits.push(modelOf(s, 'translate_model') || (s.provider === 'local' ? 'whichever model is loaded' : 'no model chosen'));
+    if (s.provider !== 'local') bits.push(s.keys[s.provider] ? `key ${s.keys[s.provider]}` : 'no key yet');
+    return bits.join(' · ');
+  }
+  async function loadModels(force) {
+    const prov = S.settings.provider;
+    if (prov === 'anthropic' || (modelLists[prov] && !force)) return;
+    if (prov !== 'local' && !S.settings.keys[prov]) return;
+    modelLists[prov] = modelLists[prov] || [];
+    try { modelLists[prov] = (await call('models')).models || []; } catch (e) { /* the field still takes a typed name */ }
+    if (S) renderTranslator();
+  }
+  async function saveKey(value) {
+    const prov = S.settings.provider;
+    if (value) await call('settings', { provider: prov, api_key: value });
+    keyStatus = { cls: '', text: 'Checking the key…' };
+    await refresh();
+    try {
+      const r = await call('test_key');
+      keyStatus = { cls: 'ok', text: `The key works (${r.model}).` };
+      translatorOpen = false;
+      toast('The key works.');
+    } catch (e) {
+      keyStatus = { cls: 'bad', text: e.message };
+      translatorOpen = true;
+    }
+    estimates = null;
+    await refresh();
+    loadEstimates();
+    loadModels(true);
+  }
+
+  function renderTranslator() {
+    const box = $('#translatorCard');
+    const p = S.project;
+    if (!p) { if (changed('translator', null)) box.replaceChildren(); return; }
+    const s = S.settings;
+    const ready = translatorReady();
+    const open = translatorOpen || !ready;
+    const models = modelLists[s.provider] || [];
+    const stats = !!p.stats;
+    if (!changed('translator', [s.provider, s.keys, s.preset, s.review, s.translate_model, open, keyStatus, models, stats, estimates])) return;
+    const prov = S.providers[s.provider];
+    const typed = $('#apiKey') ? $('#apiKey').value : '';
+    // Whatever is being typed survives the redraw.
+    const active = document.activeElement;
+    const focusId = active && box.contains(active) && active.id ? active.id : null;
+    const typedModel = focusId === 'tmodel' ? active.value : null;
+    const refocus = () => {
+      const el = focusId && document.getElementById(focusId);
+      if (!el) return;
+      if (typedModel != null) el.value = typedModel;
+      el.focus();
+    };
+    const card = h('div', { class: 'card translator' });
+    card.append(h('div', { class: 'card-head' },
+      h('div', null, h('h2', { text: 'Translator' }), open ? null : h('div', { class: 'card-sub', text: translatorSummary() })),
+      ready ? h('button', { class: 'btn btn-quiet', onclick: () => { translatorOpen = !open; render(); } }, open ? 'Done' : 'Change') : null));
+    if (!open) { box.replaceChildren(card); return; }
+
+    card.append(h('div', { class: 'field-group' },
+      h('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'Provider' }, Object.entries(S.providers).map(([id, pr]) => h('button', {
+        'aria-pressed': String(s.provider === id), role: 'radio', 'aria-checked': String(s.provider === id),
+        onclick: () => safe(async () => { keyStatus = null; translatorOpen = true; await call('settings', { provider: id }); estimates = null; await refresh(); loadEstimates(); loadModels(); }),
+      }, pr.label)))));
+
+    if (s.provider !== 'local') {
+      const saved = s.keys[s.provider];
+      const key = h('input', { class: 'input', type: 'password', id: 'apiKey', autocomplete: 'off', spellcheck: 'false',
+        placeholder: saved ? `Saved (${saved}). Paste a new key to replace it.` : `Paste your key (${prov.key_hint})` });
+      key.value = typed;
+      const go = () => safe(() => saveKey(key.value.trim()));
+      key.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+      // A pasted key is saved and checked straight away.
+      key.addEventListener('paste', () => setTimeout(() => { if (key.value.trim().length > 12) go(); }, 0));
+      card.append(h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'apiKey', text: 'API key' }),
+        h('div', { class: 'key-row' }, key, h('button', { class: saved ? 'btn' : 'btn btn-primary', onclick: go }, saved ? 'Test' : 'Save')),
+        keyStatus ? h('div', { class: 'key-status ' + keyStatus.cls, role: 'status', text: keyStatus.text }) : null,
+        prov.key_url ? h('p', { class: 'hint' }, 'Get a key at ', h('a', { href: prov.key_url, target: '_blank', rel: 'noopener', text: prov.key_url.replace('https://', '') }),
+          '. You pay the provider directly; the key is stored only on this computer.') : null));
+    }
+
+    if (s.provider === 'anthropic') {
+      card.append(h('div', { class: 'field-group' }, h('div', { class: 'label', text: 'Quality' }),
+        h('div', { class: 'presets', role: 'radiogroup', 'aria-label': 'Quality' }, Object.entries(S.presets).map(([id, pre]) => {
+          const est = estimates && estimates[id];
+          return h('button', { class: 'preset', role: 'radio', 'aria-checked': String(s.preset === id),
+            onclick: () => safe(async () => { await call('settings', { preset: id, review: !!pre.review }); await refresh(); loadEstimates(); }) },
+            h('b', { text: pre.label }),
+            h('span', { class: 'blurb', text: pre.blurb }),
+            h('span', { class: 'cost', text: est && est.total ? cap(range(est.total)) : (stats ? 'Estimating…' : '') }));
+        }))));
+    } else {
+      const listId = 'modelList';
+      const tm = h('input', { class: 'input', id: 'tmodel', list: listId, value: modelOf(s, 'translate_model'), autocomplete: 'off', spellcheck: 'false',
+        placeholder: s.provider === 'local' ? 'Automatic: whichever model is loaded' : 'Model ID, for example ' + ({ openai: 'gpt-5-mini', openrouter: 'google/gemini-2.5-flash' }[s.provider] || 'from your provider') });
+      tm.addEventListener('change', () => safe(async () => { await call('settings', { translate_model: tm.value }); estimates = null; await refresh(); loadEstimates(); }));
+      card.append(h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'tmodel', text: 'Model' }), tm,
+        h('datalist', { id: listId }, models.map((m) => h('option', { value: m }))),
+        h('p', { class: 'hint', text: s.provider === 'local'
+          ? 'Start the local server in LM Studio (Developer tab) or Ollama first. Local models are free but slower, and quality depends on the model.'
+          : 'A review model, prices and the API address are in Settings.' })));
+    }
+    box.replaceChildren(card);
+    refocus();
+  }
+
+  // ------------------------------------------------------------ settings
   $('#budget').addEventListener('change', (e) => safe(() => call('settings', { budget_usd: parseFloat(e.target.value) || 0 })));
   const ADV = [['#batchSize', 'batch_size', '#bsVal', 40], ['#parallel', 'parallel', '#parVal', 4], ['#contextLines', 'context_lines', '#ctxVal', 10]];
-  function renderAdvanced() {
-    for (const [id, key, lab, def] of ADV) {
-      if (document.activeElement !== $(id)) $(id).value = S.settings[key] != null ? S.settings[key] : def;
-      $(lab).textContent = $(id).value;
-    }
-  }
   for (const [id, key, lab] of ADV) {
     $(id).addEventListener('input', () => { $(lab).textContent = $(id).value; });
     $(id).addEventListener('change', () => safe(async () => { await call('settings', { [key]: +$(id).value }); estimates = null; loadEstimates(); }));
   }
-
-  function renderPresets() {
+  function renderSettings() {
+    if (view !== 'settings') return;
     const s = S.settings;
-    $('#presets').replaceChildren(...Object.entries(S.presets).map(([id, p]) => {
-      const est = estimates && estimates[id];
-      return h('button', { class: 'preset', role: 'radio', 'aria-checked': String(s.preset === id),
-        onclick: () => safe(async () => { await call('settings', { preset: id, review: !!p.review }); refresh(); }) },
-        h('b', { text: p.label }),
-        h('span', { class: 'models', text: p.review ? `${p.translate} with ${p.review}` : p.translate }),
-        h('span', { class: 'blurb', text: p.blurb }),
-        h('span', { class: 'cost', text: est && est.total ? cap(range(est.total)) : (S.project && S.project.stats ? 'Estimating…' : 'Read the scripts to see the cost') }));
-    }));
+    const b = $('#budget');
+    if (document.activeElement !== b) b.value = s.budget_usd || '';
+    for (const [id, key, lab, def] of ADV) {
+      if (document.activeElement !== $(id)) $(id).value = s[key] != null ? s[key] : def;
+      $(lab).textContent = $(id).value;
+    }
+    const f = $('#providerExtras');
+    if (isTyping(f)) return;
+    if (!changed('extras', [s.provider, s.translate_model, s.review_model, s.base_urls, s.prices])) return;
+    f.replaceChildren();
+    if (s.provider === 'anthropic') return;
+    const prov = S.providers[s.provider];
+    const rm = h('input', { class: 'input', id: 'rmodel', value: modelOf(s, 'review_model'), placeholder: 'Optional: a stronger model that edits every line' });
+    const bu = h('input', { class: 'input', id: 'burl', value: (s.base_urls || {})[s.provider] || prov.base_url });
+    rm.addEventListener('change', () => safe(async () => { await call('settings', { review_model: rm.value, review: !!rm.value.trim() }); toast('Saved.'); refresh(); }));
+    bu.addEventListener('change', () => safe(async () => { await call('settings', { base_url: bu.value }); toast('Saved.'); refresh(); }));
+    // Paid providers: the price per million tokens, for estimates and the spending limit.
+    const priceRow = (model) => {
+      const cur = (s.prices || {})[model] || [];
+      const pin = h('input', { class: 'input', inputmode: 'decimal', value: cur[0] ?? '', placeholder: 'Input', 'aria-label': `${model} input price, USD per million tokens` });
+      const pout = h('input', { class: 'input', inputmode: 'decimal', value: cur[1] ?? '', placeholder: 'Output', 'aria-label': `${model} output price, USD per million tokens` });
+      const save = () => safe(async () => {
+        const both = pin.value.trim() !== '' && pout.value.trim() !== '';
+        await call('settings', { prices: { [model]: both ? [pin.value, pout.value] : null } });
+        toast('Saved.'); estimates = null; refresh();
+      });
+      [pin, pout].forEach((x) => x.addEventListener('change', save));
+      return h('div', { class: 'field-group' }, h('div', { class: 'label', text: `Price of ${model}` }),
+        h('div', { class: 'two' }, pin, pout), h('p', { class: 'hint', text: 'In $ per million tokens: input, then output.' }));
+    };
+    const tmName = modelOf(s, 'translate_model');
+    const rmName = modelOf(s, 'review_model');
+    f.append(h('div', { class: 'field-group' }, h('div', { class: 'label', text: prov.label })),
+      h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'rmodel', text: 'Review model' }), rm),
+      h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'burl', text: 'API address' }), bu));
+    if (s.provider !== 'local') {
+      if (tmName) f.append(priceRow(tmName));
+      if (rmName && rmName !== tmName) f.append(priceRow(rmName));
+      f.append(h('p', { class: 'hint', text: 'Enter each model\'s price (from your provider\'s pricing page) to see cost estimates and use a spending limit. Without a price, a run with a spending limit won\'t start.' }));
+    }
   }
 
+  // ------------------------------------------------------------ translate
   async function loadEstimates() {
     if (!S || !S.project || !S.project.stats) return;
     try { estimates = await call('estimate', { all: true }); } catch (e) { estimates = null; }
-    if (view === 'translator') renderPresets();
-    renderRun();
-    if (view === 'run') loadNotes();
+    if (S) { renderTranslator(); renderRun(); }
+    loadNotes();
   }
   async function loadNotes() {
     let r;
     try { r = await call('preflight'); } catch (e) { return; }
+    if (!changed('notes', [r, S.project && [S.project.translated, S.project.reviewed], reviewOn()])) return;
     const items = (r.notes || []).map((n) => h('li', { class: n.level }, n.text));
+    // While the main button still has work to do it takes care of these
+    // itself; they're only worth showing for what's left afterwards.
+    const p = S.project || {};
+    const pending = !p.total || p.translated < p.total || (reviewOn() && p.reviewed < p.total);
+    if (pending) { r.glossary_issues = 0; r.overflow = 0; }
     if (r.glossary_issues) {
-      items.push(h('li', { class: 'warn' }, `${plural(r.glossary_issues, 'line')} ${r.glossary_issues === 1 ? 'doesn\'t' : 'don\'t'} use the glossary's spelling of a name or term.`,
+      items.push(h('li', { class: 'warn' }, `${plural(r.glossary_issues, 'line')} ${r.glossary_issues === 1 ? 'doesn\'t' : 'don\'t'} use the agreed spelling of a name or term.`,
         h('button', { class: 'btn btn-quiet', onclick: () => { linesState.filter = 'problems'; show('lines'); } }, 'See them'),
         h('button', { class: 'btn', onclick: () => run('glossary') }, 'Fix them')));
     }
-    if (r.overflow && S.project.translated) {
+    if (r.overflow && S.project && S.project.translated) {
       items.push(h('li', { class: 'warn' }, `${plural(r.overflow, 'line')} won't fit the text box.`,
+        h('button', { class: 'btn btn-quiet', onclick: () => show('test') }, 'Text box'),
         h('button', { class: 'btn', onclick: () => run('fit') }, 'Shorten them')));
     }
     $('#runNotes').replaceChildren(...items);
   }
 
-  // ------------------------------------------------------------ 3. style
+  // A second model edits every line (the Recommended and Best presets, or a review model).
+  function reviewOn() {
+    const s = S.settings;
+    if (s.review === false) return false;
+    return s.provider === 'anthropic' ? !!(S.presets[s.preset] || {}).review : !!modelOf(s, 'review_model');
+  }
+
+  function renderRun() {
+    const box = $('#runCard');
+    const p = S.project;
+    const j = S.job || {};
+    if (!p || !p.stats) {
+      if (changed('run', null)) { box.replaceChildren(); $('#runNotes').replaceChildren(); $('#manualNote').replaceChildren(); drawn.notes = null; }
+      return;
+    }
+    const s = S.settings;
+    const est = estimates && (s.provider === 'anthropic' ? estimates[s.preset] : estimates.current);
+    const ready = translatorReady();
+    const busy = !!j.running;
+    const allDone = p.total > 0 && p.translated >= p.total;
+    const reviewing = reviewOn();
+    if (!changed('run', [p.total, p.translated, p.reviewed, p.problems, p.spent, p.installed, p.manual_output, est, ready, busy, reviewing, j.action])) return;
+    const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
+    const row = (label, a, b, cls) => h('div', { class: 'progress-row' }, h('span', { text: label }),
+      h('div', { class: 'bar ' + (cls || '') }, h('i', { style: `width:${pct(a, b)}%` })), h('span', { class: 'num', text: `${num(a)} of ${num(b)}` }));
+    const card = h('div', { class: 'card run-summary' });
+    if (p.translated > 0) {
+      card.append(row('Translated', p.translated, p.total));
+      if (reviewing) card.append(row('Reviewed', p.reviewed, p.total, 'ok'));
+    }
+    const remaining = p.total - p.translated;
+    const costLeft = est && est.total && est.total[1] > 0 ? range(est.total) : null;
+    card.append(h('p', { class: 'estimate' },
+      allDone ? 'Every line is translated. ' : p.translated ? [h('b', { text: num(remaining) }), remaining === 1 ? ' line left. ' : ' lines left. '] : null,
+      costLeft ? [allDone ? 'Finishing the review should cost ' : p.translated ? 'The rest should cost ' : 'Translating the whole game should cost ', h('b', { text: costLeft }), '. '] :
+        (!allDone && s.provider === 'local' ? 'A local model costs nothing. ' : null),
+      p.spent > 0 ? ['Spent so far: ', h('b', { text: money(p.spent) }), '. '] : null,
+      p.problems ? [h('a', { href: '#', onclick: (e) => { e.preventDefault(); linesState.filter = 'problems'; show('lines'); } }, `${plural(p.problems, 'line')} need a look`), '.'] : null));
+    const main = h('button', { class: 'btn btn-primary btn-lg', id: 'runAuto', disabled: busy, onclick: () => run('auto') },
+      busy && (j.action === 'auto' || j.action === 'test') ? 'Working…' : allDone ? (costLeft ? 'Finish and install' : 'Rebuild and install') : p.translated ? 'Continue translating' : 'Translate the game');
+    const actions = h('div', { class: 'row-actions' }, main);
+    if (!p.translated) actions.append(h('button', { class: 'btn', disabled: busy, title: 'Translate the first 150 lines of one script and install them, to check the result in the game before paying for all of it.', onclick: () => run('test') }, 'Try 150 lines first'));
+    if (p.installed) actions.append(h('button', { class: 'btn', onclick: launch }, 'Launch the game'));
+    if (p.installed) actions.append(h('button', { class: 'btn btn-quiet danger', disabled: busy, onclick: () => run('restore') }, 'Remove the patch'));
+    card.append(actions);
+    card.append(h('p', { class: 'hint', text: p.installed
+      ? 'The patch is installed. Removing it puts the original game files back.'
+      : 'Yakusu saves as it goes: stop at any time and continue later. It only changes the game when it installs the patch, and that can be undone.' }));
+    card.append(h('details', { class: 'advanced' }, h('summary', { text: 'Run one stage at a time' }),
+      h('div', { class: 'row-actions' }, [['translate', 'Translate'], ['review', 'Review'], ['fit', 'Shorten overflowing lines'], ['glossary', 'Fix name spellings'], ['build', 'Rebuild and install']]
+        .map(([a, t]) => h('button', { class: 'btn', onclick: () => run(a) }, t)))));
+    box.replaceChildren(card);
+    const mn = $('#manualNote');
+    mn.replaceChildren();
+    if (p.manual_output) {
+      mn.append(h('div', { class: 'callout' }, 'This engine needs one manual step. The patched script files are in ',
+        h('code', { text: p.manual_output }), '. ', (p.engine && p.engine.note) || '', ' ',
+        h('button', { class: 'btn btn-quiet', onclick: () => safe(() => call('reveal', { which: 'manual' })) }, 'Open folder')));
+    }
+  }
+
+  // 完訳 (a complete translation): shown once when a full run finishes.
+  function showKept(result) {
+    const key = S.job.finished;
+    if (keptShownFor === key) return;
+    keptShownFor = key;
+    const name = S.project ? S.project.name : 'The game';
+    const pet = h('div', { class: 'petals', 'aria-hidden': 'true' });
+    const left = result.left || 0;
+    $('#kept').replaceChildren(h('div', { class: 'kept', role: 'status' },
+      pet, svgUse('branch'),
+      h('h2', { lang: 'ja', text: '完訳' }),
+      h('p', null, result.installed
+        ? `${name} is in English: ${plural(result.applied || 0, 'line')} translated and installed. The original files are kept, so the patch can be removed at any time.`
+        : `${name} is translated: ${plural(result.applied || 0, 'line')}. This engine needs one manual step to put them in the game (see below).`),
+      left ? h('p', null, `${plural(left, 'line')} stayed in Japanese` + (result.declined ? ` (the model declined ${result.declined === left ? 'to translate them' : num(result.declined) + ' of them'})` : '') + '. ',
+        h('a', { href: '#', onclick: (e) => { e.preventDefault(); linesState.filter = 'problems'; show('lines'); } }, 'Look at them')) : null,
+      h('div', { class: 'inline' },
+        result.installed ? h('button', { class: 'btn btn-primary', onclick: launch }, 'Launch the game') : null,
+        h('button', { class: 'btn btn-quiet', onclick: () => $('#kept').replaceChildren() }, 'Dismiss'))));
+    petals(pet, 9, true);
+    show('home');
+  }
+
+  function launch() { safe(async () => { const r = await call('launch'); toast(`Started ${r.launched}.`); }); }
+  const NEEDS_MODEL = ['auto', 'test', 'style', 'translate', 'review', 'fit', 'glossary'];
+  function run(action) {
+    safe(async () => {
+      if (!S.project) throw new Error('Choose a game folder first.');
+      if (NEEDS_MODEL.includes(action) && !translatorReady()) {
+        const s = S.settings;
+        return needSetup(s.keys[s.provider] ? 'model' : 'key', s.keys[s.provider] ? 'Choose a model first.' : 'Paste your API key first.');
+      }
+      if (action === 'restore' && !confirmInline('restore', 'Press again to remove the patch and put the original game files back.')) return;
+      if (action === 'auto') $('#kept').replaceChildren();
+      try {
+        await call('run', { action });
+      } catch (e) {
+        // A local server that isn't running, or has nothing loaded.
+        if (NEEDS_MODEL.includes(action) && S.settings.provider === 'local') return needSetup('model', e.message);
+        throw e;
+      }
+      await refresh();
+    });
+  }
+  let armed = null;
+  function confirmInline(what, message) {
+    // Ask by pressing twice instead of a blocking dialog.
+    if (armed === what) { armed = null; return true; }
+    armed = what;
+    toast(message);
+    setTimeout(() => { if (armed === what) armed = null; }, 4000);
+    return false;
+  }
+
+  // ------------------------------------------------------------ style and names
   async function loadStyle() {
     if (!S || !S.project) return;
     const r = await call('get_style');
@@ -508,7 +752,9 @@
     for (const sp of speakers) if (!names.find(([j]) => j === sp)) names.push([sp, '']);
     $('#namesBody').replaceChildren(...names.map(([j, e]) => pairRow(j, e)));
     $('#termsBody').replaceChildren(...(((r.glossary && r.glossary.terms) || []).map((t) => pairRow(t.jp, t.en))));
-    $('#styleHint').textContent = S.project.has_style ? 'Drafting again replaces the style sheet and adds new names. Names you set are kept.' : 'Costs a few cents.';
+    $('#draftStyle').textContent = S.project.has_style ? 'Draft again from the script' : 'Draft now';
+    $('#draftStyle').className = S.project.has_style ? 'btn' : 'btn btn-primary';
+    $('#styleHint').textContent = S.project.has_style ? 'Drafting again replaces the style sheet and adds new names. Names you set are kept.' : 'Costs a few cents. Translating does this by itself if you skip it.';
   }
   function pairRow(j, e) {
     return h('tr', null, h('td', null, h('input', { value: j || '', 'aria-label': 'Japanese', lang: 'ja' })),
@@ -537,7 +783,7 @@
     if (e.target.matches('#styleText, .names input')) saveStyleSoon();
   });
 
-  // ------------------------------------------------------------ 4. test
+  // ------------------------------------------------------------ text box
   function renderTest() {
     if (view !== 'test' || !S.project) return;
     const p = S.project;
@@ -614,78 +860,7 @@
     $('#lineCounter').textContent = `${previewIdx + 1} / ${previewLines.length}`;
     $('#sceneJp').textContent = (ln.jp || '').replace(/⟦\d+⟧/g, ' ');
   }
-  window.addEventListener('resize', () => { drawPreview(); if (S) drawThread($$('.steps button').map((b) => b.classList.contains('done'))); });
-
-  // ------------------------------------------------------------ 5. run
-  function renderRun() {
-    if (view !== 'run' || !S.project) return;
-    const p = S.project;
-    const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
-    const row = (label, a, b, cls) => h('div', { class: 'progress-row' }, h('span', { text: label }),
-      h('div', { class: 'bar ' + (cls || '') }, h('i', { style: `width:${pct(a, b)}%` })), h('span', { class: 'num', text: `${num(a)} of ${num(b)}` }));
-    const kids = [row('Translated', p.translated, p.total)];
-    if (S.settings.review !== false) kids.push(row('Reviewed', p.reviewed, p.total, 'ok'));
-    const est = estimates && estimates[S.settings.preset];
-    const remaining = p.total - p.translated;
-    kids.push(h('div', { class: 'estimate' },
-      remaining > 0 ? [h('b', { text: num(remaining) }), ' lines left. ',
-        est && est.total ? ['The rest should cost ', h('b', { text: range(est.total) }), '. '] : null] : 'Every line is translated. ',
-      'Spent so far: ', h('b', { text: money(p.spent) }), '.',
-      p.problems ? [' ', h('a', { href: '#', onclick: (e) => { e.preventDefault(); linesState.filter = 'problems'; show('lines'); } }, `${plural(p.problems, 'line')} need a look`), '.'] : null));
-    if (p.installed) kids.push(h('div', { class: 'installed-note', text: 'The patch is installed. Launch the game to play in English.' }));
-    $('#runSummary').replaceChildren(...kids);
-    const btn = $('#runFull');
-    btn.textContent = p.translated >= p.total && p.total ? 'Rebuild and install' : (p.translated ? 'Continue translating' : 'Translate everything');
-    const mn = $('#manualNote');
-    mn.replaceChildren();
-    if (p.manual_output) {
-      mn.append(h('div', { class: 'callout' }, 'This engine needs one manual step. The patched script files are in ',
-        h('code', { text: p.manual_output }), '. ', (p.engine && p.engine.note) || '', ' ',
-        h('button', { class: 'btn btn-quiet', onclick: () => safe(() => call('reveal', { which: 'manual' })) }, 'Open folder')));
-    }
-  }
-  $('#runFull').addEventListener('click', () => {
-    const p = S.project;
-    run(p && p.translated >= p.total && p.total ? 'build' : 'full');
-  });
-  $('#launch2').addEventListener('click', launch);
-  $$('[data-action]').forEach((b) => b.addEventListener('click', () => run(b.dataset.action)));
-
-  // 完訳 (a complete translation): shown once when a full run finishes.
-  function showKept(applied) {
-    const key = S.job.finished;
-    if (keptShownFor === key) return;
-    keptShownFor = key;
-    const pet = h('div', { class: 'petals', 'aria-hidden': 'true' });
-    $('#kept').replaceChildren(h('div', { class: 'kept', role: 'status' },
-      pet, svgUse('branch'),
-      h('h2', { lang: 'ja', text: '完訳' }),
-      h('p', null, `Fully translated. ${applied ? plural(applied, 'line') + ' of ' + (S.project ? S.project.name : 'the game') + ' are' : 'The translation is'} in English and installed. Every change can still be undone from this page.`),
-      h('div', { class: 'inline' },
-        h('button', { class: 'btn btn-primary', onclick: launch }, 'Launch the game'),
-        h('button', { class: 'btn btn-quiet', onclick: () => $('#kept').replaceChildren() }, 'Dismiss'))));
-    petals(pet, 9, true);
-    show('run');
-  }
-
-  function launch() { safe(async () => { const r = await call('launch'); toast(`Started ${r.launched}.`); }); }
-  function run(action) {
-    safe(async () => {
-      if (!S.project) throw new Error('Choose a game folder first.');
-      if (action === 'restore' && !confirmInline('restore', 'Press again to restore the original game files.')) return;
-      await call('run', { action });
-      await refresh();
-    });
-  }
-  let armed = null;
-  function confirmInline(what, message) {
-    // Ask by pressing twice instead of a blocking dialog.
-    if (armed === what) { armed = null; return true; }
-    armed = what;
-    toast(message);
-    setTimeout(() => { if (armed === what) armed = null; }, 4000);
-    return false;
-  }
+  window.addEventListener('resize', () => { if (view === 'test') drawPreview(); });
 
   // ------------------------------------------------------------ lines
   $$('#lineFilter button').forEach((b) => b.addEventListener('click', () => {
@@ -718,7 +893,7 @@
     $('#retranslatePage').hidden = !['problems', 'untranslated', 'reviewed'].includes(linesState.filter);
     const list = $('#linesList');
     if (!S || !S.project || !S.project.extracted) {
-      list.replaceChildren(h('div', { class: 'empty-state' }, svgUse('branch'), 'Open a game and read its scripts. Its lines will be listed here.'));
+      list.replaceChildren(h('div', { class: 'empty-state' }, svgUse('branch'), 'Open a game on the Translate page. Its lines will be listed here.'));
       $('#pager').replaceChildren();
       return;
     }
@@ -773,9 +948,13 @@
 
   // ------------------------------------------------------------ start
   refresh().then(() => {
+    show('home');
+    loadModels();
+    // A game that was opened but never read (the app was closed first): read it now.
     const p = S && S.project;
-    if (p && p.extracted) show(p.translated ? 'run' : (S.settings.keys[S.settings.provider] ? 'style' : 'translator'));
-    else show('game');
+    if (p && !p.extracted && p.engine && p.engine.engine_id !== 'unsupported' && !(S.job || {}).running) {
+      call('run', { action: 'extract' }).then(refresh, () => {});
+    }
     loop();
   });
 })();

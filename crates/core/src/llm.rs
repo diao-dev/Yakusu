@@ -220,7 +220,7 @@ impl Think {
     }
 
     /// The model may think before it answers.
-    fn thinks(self) -> bool {
+    pub fn thinks(self) -> bool {
         matches!(self, Think::LowEffort | Think::Default)
     }
 }
@@ -545,7 +545,9 @@ pub fn list_models(provider_id: &str, api_key: &str, base_url: Option<&str>) -> 
     };
     let resp = req.send().map_err(|e| {
         if provider_id == "local" {
-            format!("Can't reach the local model at {base}. Start the server in LM Studio (Developer tab), then try again.")
+            format!(
+                "Can't reach the local model at {base}. Start the server in LM Studio (Developer tab), then try again."
+            )
         } else {
             format!("Couldn't reach {}: {e}", p.label)
         }

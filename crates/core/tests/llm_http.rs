@@ -260,7 +260,10 @@ fn claude_adapts_when_a_thinking_setting_is_refused() {
     drop(reqs);
 
     // An older model without effort levels ends on a plain request.
-    m.queue.lock().unwrap().extend([no("output_config.effort: Extra inputs are not permitted"), anthropic_ok("plain", "end_turn")]);
+    m.queue
+        .lock()
+        .unwrap()
+        .extend([no("output_config.effort: Extra inputs are not permitted"), anthropic_ok("plain", "end_turn")]);
     let c = client(&m, "anthropic", "claude-opus-3");
     assert_eq!(go(&c).unwrap().text, "plain");
     let reqs = m.requests.lock().unwrap();
@@ -280,11 +283,18 @@ fn claude_adapts_when_a_thinking_setting_is_refused() {
 fn claude_thinking_blocks_refusals_and_spent_limits() {
     let m = mock();
     let reply = |content: Value, stop: &str| {
-        (200, json!({"type": "message", "content": content, "stop_reason": stop, "usage": {"output_tokens": 500}}), vec![])
+        (
+            200,
+            json!({"type": "message", "content": content, "stop_reason": stop, "usage": {"output_tokens": 500}}),
+            vec![],
+        )
     };
     m.queue.lock().unwrap().extend([
         // Thinking comes first and has no text: the answer is the text block.
-        reply(json!([{"type": "thinking", "thinking": "", "signature": "s"}, {"type": "text", "text": "answer"}]), "end_turn"),
+        reply(
+            json!([{"type": "thinking", "thinking": "", "signature": "s"}, {"type": "text", "text": "answer"}]),
+            "end_turn",
+        ),
         // The whole limit went on thinking.
         reply(json!([{"type": "thinking", "thinking": "", "signature": "s"}]), "max_tokens"),
         // The safety system declined.
