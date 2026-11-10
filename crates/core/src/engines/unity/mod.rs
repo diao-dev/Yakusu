@@ -37,6 +37,9 @@ const MONO_BEHAVIOUR: i32 = 114;
 const MAX_BUNDLE: u64 = 512 << 20;
 const MAX_ASSETS: u64 = 1536 << 20;
 
+/// How a localization fragment separator travels through translation.
+const FRAGMENT: &str = "{|}";
+
 static AUTHOR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^([^\s:\[\]"@#;{}]{1,32}): (.*)$"#).unwrap());
 static PRINT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^(\s*@(?:print|choice|title)\s+)(?:"((?:[^"\\]|\\.)*)"|([^\s"]+))(.*)$"#).unwrap());
@@ -201,7 +204,10 @@ fn l10n_units(t: &str) -> Vec<(String, std::ops::Range<usize>, String)> {
         let mut j = i + 1;
         let mut src = Vec::new();
         while j < lines.len() && lines[j].starts_with(';') {
-            src.push(lines[j].trim_start_matches(';').trim_start());
+            // "; >" lines are annotations for translators, not the source.
+            if !lines[j].starts_with("; >") {
+                src.push(lines[j].trim_start_matches(';').trim_start());
+            }
             j += 1;
         }
         let start = j;
@@ -213,7 +219,9 @@ fn l10n_units(t: &str) -> Vec<(String, std::ops::Range<usize>, String)> {
         while end > start && lines[end - 1].trim().is_empty() {
             end -= 1;
         }
-        let source = src.join("\n");
+        // "|" separates fragments split by inline commands: it must stay, so
+        // it travels as a protected code.
+        let source = src.join("\n").replace('|', FRAGMENT);
         if JP_RE.is_match(&source) {
             // Keep an "Author: " prefix when the existing translation has it too.
             let keep = AUTHOR_RE
@@ -227,6 +235,19 @@ fn l10n_units(t: &str) -> Vec<(String, std::ops::Range<usize>, String)> {
         i = j;
     }
     out
+}
+
+/// Locale tags found in bundle paths, best target first: (pattern, name).
+const LOCALES: &[(&str, &str)] = &[
+    (r"(^|[^a-z])(en|en[-_]?us|en[-_]?gb|english)([^a-z]|$)", "English"),
+    (r"(zh[-_]?hans|zh[-_]?cn|chs|schinese|simplified)", "Simplified Chinese"),
+    (r"(zh[-_]?hant|zh[-_]?tw|cht|tchinese|traditional)", "Traditional Chinese"),
+    (r"(^|[^a-z])(ko|ko[-_]?kr|korean)([^a-z]|$)", "Korean"),
+];
+
+fn locale_rank(path: &str) -> usize {
+    let p = path.to_lowercase();
+    LOCALES.iter().position(|(re, _)| Regex::new(re).unwrap().is_match(&p)).unwrap_or(LOCALES.len())
 }
 
 fn is_textmap(f: &StrField) -> bool {
@@ -270,7 +291,7 @@ fn apply_text(t: &str, f: &Format, entries: &[Entry]) -> Result<String> {
             // Last first, so earlier line numbers stay valid.
             for ((text, range, keep), e) in units.into_iter().zip(entries).rev() {
                 if e.message != text {
-                    let new = format!("{keep}{}{cr}", e.message.replace('\n', " "));
+                    let new = format!("{keep}{}{cr}", e.message.replace('\n', " ").replace(FRAGMENT, "|"));
                     lines.splice(range, std::iter::once(new));
                 }
             }
@@ -431,10 +452,8 @@ impl Engine for Unity {
         if list.is_empty() {
             return user("No Unity data files were found next to the game.");
         }
-        let (mut lines, mut objects) = (0usize, 0usize);
-        let mut found: Vec<Value> = Vec::new();
+        let mut hits: Vec<(String, String, i64, Format, Vec<Entry>)> = Vec::new();
         for (k, (rel, kind)) in list.iter().enumerate() {
-            let before = lines;
             let path = inst.original(&game, rel)?;
             if k > 0 && k % 50 == 0 {
                 cx.log(format!("Looked through {k} of {} data files", list.len()));
@@ -452,12 +471,29 @@ impl Engine for Unity {
             for (node, b) in serialized_files(&loaded) {
                 let Ok(sf) = SerializedFile::parse(b) else { continue };
                 for (pid, f, es) in scan(&sf, b) {
-                    lines += es.len();
-                    objects += 1;
-                    write_json_messages(&safe_join(&json, &json_rel(rel, &node, pid, &f))?, &es)?;
+                    hits.push((rel.clone(), node.clone(), pid, f, es));
                 }
             }
-            if lines > before {
+        }
+        // Localization documents, when the game has them: the Japanese
+        // source is translated into one locale's documents (English if
+        // there are any, else Chinese, ...), and the scripts are left alone.
+        if hits.iter().any(|h| h.3 == Format::L10n) {
+            let best = hits.iter().filter(|h| h.3 == Format::L10n).map(|h| locale_rank(&h.0)).min().unwrap();
+            hits.retain(|h| h.3 == Format::L10n && locale_rank(&h.0) == best);
+            let label = LOCALES.get(best).map(|l| l.1).unwrap_or("that");
+            cx.log(format!(
+                "Writing the English into the game's {label} localization: choose {label} in the game's language settings to read it."
+            ));
+            self.m.set("locale", label);
+        }
+        let (mut lines, mut objects) = (0usize, 0usize);
+        let mut found: Vec<Value> = Vec::new();
+        for (rel, node, pid, f, es) in &hits {
+            lines += es.len();
+            objects += 1;
+            write_json_messages(&safe_join(&json, &json_rel(rel, node, *pid, f))?, es)?;
+            if !found.iter().any(|v| v == rel.as_str()) {
                 found.push(Value::from(rel.clone()));
             }
         }
@@ -582,6 +618,34 @@ mod tests {
             .map(|s| Entry { name: None, names: None, message: s.to_string() })
             .collect();
         let out = apply_text(&doc, &Format::L10n, &en).unwrap();
+        let frag = "# x|y\n; > @print \"#x\" ...\n; 前半|後半\n前|后\n# z\n; 二\n二\n# w\n; 三\n三\n";
+        assert!(is_l10n(frag));
+        let fe = export_text(frag, &Format::L10n);
+        assert_eq!(fe[0].message, "前半{|}後半");
+        let p = crate::protect::protect(&fe[0].message, "\n");
+        assert!(!p.text.contains('|'));
+        let mut fe2 = fe.clone();
+        fe2[0].message = "First {|}second".into();
+        let fo = apply_text(frag, &Format::L10n, &fe2).unwrap();
+        assert!(fo.contains("; 前半|後半\nFirst |second\n"), "{fo}");
         assert_eq!(out, "# ~a1\n; Kohaku: おはよう！\nKohaku: Morning!\n\n# ~a2\n; 地の文。\nNarration.\n\n# ~a3\n; Hello\nHello\n# ~a4\n; 四つ目\nFourth\n");
+    }
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::locale_rank;
+
+    #[test]
+    fn locales_from_paths() {
+        assert_eq!(
+            locale_rank("G_Data/StreamingAssets/aa/StandaloneWindows64/localization-zhhans_assets_all.bundle"),
+            1
+        );
+        assert_eq!(locale_rank("G_Data/StreamingAssets/aa/StandaloneWindows64/l10n-en-us.bundle"), 0);
+        assert_eq!(locale_rank("G_Data/StreamingAssets/aa/StandaloneWindows64/local_zh-hant.bundle"), 2);
+        assert_eq!(locale_rank("G_Data/StreamingAssets/aa/StandaloneWindows64/naninovel-scripts.bundle"), 4);
+        // "en" inside a word isn't English.
+        assert_eq!(locale_rank("G_Data/StreamingAssets/scenes_assets.bundle"), 4);
     }
 }

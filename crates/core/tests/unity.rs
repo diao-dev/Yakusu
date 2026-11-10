@@ -264,3 +264,45 @@ fn texture_bundles_are_recognised_without_unpacking() {
     c.dedup();
     assert_eq!(c, vec![28, 142, 213, 687078895]);
 }
+
+#[test]
+fn localization_documents_win_over_scripts() {
+    use common::*;
+    let tmp = tempfile::tempdir().unwrap();
+    let env = env(tmp.path());
+    let game = tmp.path().join("L10n Game");
+    let aa = game.join("Game_Data/StreamingAssets/aa/StandaloneWindows64");
+    std::fs::create_dir_all(&aa).unwrap();
+    std::fs::write(game.join("UnityPlayer.dll"), b"MZ").unwrap();
+    let b = Bundle::open(&fixture("banner_1")).unwrap();
+    let data = b.data().unwrap();
+    let put = |name: &str, assets: &[(i64, &str, &str)]| {
+        let cab = serialized_with_text(assets);
+        b.rewrite(&data, &HashMap::from([(b.nodes[0].path.clone(), cab)]), &aa.join(name), true).unwrap();
+    };
+    let doc = "# aa1\n; おはよう！\n早上好！\n\n# aa2|aa3\n; > @print \"#aa2\"\n; 前半|後半\n前|后\n\n# aa4\n; 三つ目\n第三\n";
+    put("naninovel-scripts_assets_all.bundle", &[(3, "chapter1", SCRIPT)]);
+    put("localization-zhhans_assets_all.bundle", &[(5, "chapter1", doc)]);
+    put("localization-zhhant_assets_all.bundle", &[(5, "chapter1", doc)]);
+    let (factory, _) = fake();
+    let pipe = pipeline(&env, &game, settings("recommended", 4, 2), factory);
+    let stats = pipe.extract().unwrap();
+    assert_eq!(stats.lines, 3, "only the Simplified Chinese documents");
+    assert_eq!(pipe.p.meta().engine.clone().unwrap().str("locale"), Some("Simplified Chinese"));
+    pipe.draft_style().unwrap();
+    pipe.translate(None, false).unwrap();
+    pipe.build().unwrap();
+    let out = pipe.p.work("out/Game_Data/StreamingAssets/aa/StandaloneWindows64");
+    let names: Vec<String> =
+        std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert_eq!(names, vec!["localization-zhhans_assets_all.bundle".to_string()]);
+    let nb = Bundle::open(&out.join(&names[0])).unwrap();
+    let nd = nb.data().unwrap();
+    let cab = nb.node(&nd, &nb.nodes[0]).unwrap();
+    let sf = SerializedFile::parse(cab).unwrap();
+    let text = String::from_utf8(sf.text_asset(sf.object(cab, &sf.objects[0])).unwrap().1).unwrap();
+    assert!(text.contains("; おはよう！\n") && text.contains("# aa2|aa3\n"), "{text}");
+    assert!(!text.contains("早上好") && !text.contains("前|后"), "{text}");
+    let frag = text.lines().skip_while(|l| !l.starts_with("; 前半")).nth(1).unwrap();
+    assert_eq!(frag.matches('|').count(), 1, "{text}");
+}
