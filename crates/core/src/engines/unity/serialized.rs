@@ -93,7 +93,7 @@ impl R<'_> {
         Ok(if self.little { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) })
     }
     fn cstr(&mut self) -> Result<String> {
-        let end = self.b[self.i..].iter().position(|&c| c == 0).ok_or_else(|| bad("cut short"))?;
+        let end = self.b.get(self.i..).unwrap_or(&[]).iter().position(|&c| c == 0).ok_or_else(|| bad("cut short"))?;
         let s = String::from_utf8_lossy(&self.b[self.i..self.i + end]).to_string();
         self.i += end + 1;
         Ok(s)
@@ -143,6 +143,9 @@ impl SerializedFile {
             return Err(bad("too short"));
         }
         let version = be32(b, 8);
+        if version >= 22 && b.len() < 48 {
+            return Err(bad("too short"));
+        }
         if !(9..=30).contains(&version) {
             return Err(bad(format!("format {version} isn't supported")));
         }

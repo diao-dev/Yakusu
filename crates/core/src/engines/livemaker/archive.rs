@@ -203,6 +203,15 @@ impl Archive {
         if matches!(layout, Layout::Ext) && !parts[0].is_file() {
             return Err(bad(path, "the .dat file that goes with it is missing"));
         }
+        // Every file must lie inside the data.
+        let avail: u64 = match layout {
+            Layout::Exe(start) => len - start,
+            Layout::Dat => parts.iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum(),
+            Layout::Ext => parts.iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum(),
+        };
+        if entries.iter().any(|e| e.offset.checked_add(e.size).is_none_or(|end| end > avail)) {
+            return Err(bad(path, "its file list points past the end of the data"));
+        }
         let mut tail = Vec::new();
         if layout == Layout::Dat && parts.len() == 1 {
             let end = entries.last().map(|e| e.offset + e.size).unwrap_or(0);

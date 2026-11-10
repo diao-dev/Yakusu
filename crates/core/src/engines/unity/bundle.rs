@@ -83,7 +83,7 @@ impl Be<'_> {
         Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
     }
     fn cstr(&mut self) -> Option<String> {
-        let end = self.b[self.i..].iter().position(|&c| c == 0)?;
+        let end = self.b.get(self.i..)?.iter().position(|&c| c == 0)?;
         let s = String::from_utf8_lossy(&self.b[self.i..self.i + end]).to_string();
         self.i += end + 1;
         Some(s)
@@ -99,11 +99,13 @@ pub fn decompress(data: &[u8], size: usize, kind: u32) -> std::result::Result<Ve
                 unpacked_size: lzma_rs::decompress::UnpackedSize::UseProvided(Some(size as u64)),
                 ..Default::default()
             };
-            let mut out = Vec::with_capacity(size);
+            let mut out = Vec::with_capacity(size.min(64 << 20));
             lzma_rs::lzma_decompress_with_options(&mut std::io::Cursor::new(data), &mut out, &opts)
                 .map_err(|e| format!("LZMA: {e}"))?;
             Ok(out)
         }
+        // LZ4 can't expand more than ~255 times: a bigger size is damage.
+        2 | 3 if size > data.len().saturating_mul(255) + 64 => Err("LZ4: damaged block".into()),
         2 | 3 => lz4_flex::block::decompress(data, size).map_err(|e| format!("LZ4: {e}")),
         k => Err(format!("compression type {k} isn't supported")),
     }
@@ -133,6 +135,9 @@ impl Bundle {
         let info_c = r.u32().ok_or_else(short)? as usize;
         let info_u = r.u32().ok_or_else(short)? as usize;
         let flags = r.u32().ok_or_else(short)?;
+        if info_c as u64 > len || info_u > 256 << 20 {
+            return Err(bad(path, "damaged header"));
+        }
         let new_flags = new_flag_set(&engine);
         if flags & if new_flags { ENCRYPTED } else { ENCRYPTED_OLD } != 0 {
             return Err(bad(path, "it's encrypted"));
@@ -197,7 +202,10 @@ impl Bundle {
     pub fn data_until(&self, limit: u64) -> Result<Vec<u8>> {
         let mut f = std::fs::File::open(&self.path)?;
         let total: u64 = self.blocks.iter().map(|b| b.uncompressed as u64).sum();
-        let mut out = Vec::with_capacity(total.min(limit.saturating_add(CHUNK as u64)) as usize);
+        if total > 4 << 30 || self.blocks.iter().any(|b| b.compressed as u64 > len_of(&self.path)) {
+            return Err(bad(&self.path, "damaged block list"));
+        }
+        let mut out = Vec::with_capacity(total.min(limit.saturating_add(CHUNK as u64)).min(256 << 20) as usize);
         let mut at = self.data_start;
         for b in &self.blocks {
             if out.len() as u64 >= limit {
@@ -360,6 +368,10 @@ impl Bundle {
         w.flush()?;
         Ok(())
     }
+}
+
+fn len_of(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Unity 2020.3.34 / 2021.3.2 / 2022.1.1 and later use 0x200 for padding
