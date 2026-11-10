@@ -75,6 +75,27 @@ impl<'a> Cur<'a> {
         }
         Ok(())
     }
+    /// Like [`Cur::parser`], also listing each operation with its operands:
+    /// (operation, function, [(operand type, value start, value end)]).
+    fn parser_ops(&mut self) -> Result<Vec<Ope>, String> {
+        let count = self.u32()?;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let kind = self.u8()?;
+            self.pstr()?;
+            let n = self.u32()?;
+            let func = if kind == 0x0B { Some(self.u8()?) } else { None };
+            let mut ops = Vec::new();
+            for _ in 0..n {
+                let t = self.b.get(self.i).copied().ok_or_else(short)?;
+                let start = self.i + 1 + if matches!(t, 1..=3) { 0 } else { 4 };
+                self.operand()?;
+                ops.push((t, start, self.i));
+            }
+            out.push(Ope { kind, func, ops });
+        }
+        Ok(out)
+    }
     fn operand(&mut self) -> Result<(), String> {
         match self.u8()? {
             1 => self.skip(4),  // Int
@@ -96,6 +117,35 @@ impl<'a> Cur<'a> {
     }
 }
 
+/// One operation of an expression.
+pub struct Ope {
+    kind: u8,
+    func: Option<u8>,
+    /// (operand type, start, end) of each operand's value.
+    ops: Vec<(u8, usize, usize)>,
+}
+
+const OPE_FUNC: u8 = 0x0B;
+const OPE_EQUAL: u8 = 0x0C;
+const FUNC_ADD_ARRAY: u8 = 0x42;
+const PARAM_VAR: u8 = 0;
+const PARAM_STR: u8 = 4;
+/// The variables LiveNovel's standard choice menu uses.
+const MENU_ARRAY: &str = "_tmp";
+const MENU_RESULT: &str = "選択値";
+
+/// A choice in a selection menu, or a comparison against one.
+#[derive(Clone, Debug)]
+pub struct MenuStr {
+    /// The string's bytes (after its u32 length).
+    start: usize,
+    end: usize,
+    pub text: String,
+    /// True for the choice itself (`AddArray(_tmp, "...")`), false for a
+    /// jump or test comparing the result with it.
+    pub is_choice: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct TextIns {
     pub line_no: u32,
@@ -110,6 +160,8 @@ pub struct Lsb {
     pub texts: Vec<TextIns>,
     /// Byte ranges of MesNew's literal "font changeable = true" values.
     font_flags: Vec<(usize, usize)>,
+    /// Selection menu choices and the comparisons that test them.
+    pub menu: Vec<MenuStr>,
 }
 
 impl Lsb {
@@ -135,6 +187,7 @@ impl Lsb {
         let count = c.u32()?;
         let mut texts = Vec::new();
         let mut font_flags = Vec::new();
+        let mut ops: Vec<Ope> = Vec::new();
         for _ in 0..count {
             let kind = c.u8()?;
             c.skip(4 + 1 + 1)?;
@@ -142,14 +195,15 @@ impl Lsb {
             let v = version;
             let opt = |c: &mut Cur, cond: bool| if cond { c.parser() } else { Ok(()) };
             match kind {
-                0 | 1 | 6 | 0x0E | 0x13 | 0x1A | 0x1C | 0x20 | 0x27 | 0x37 => c.parser()?,
+                0 | 1 | 0x0E => ops.extend(c.parser_ops()?),
+                6 | 0x13 | 0x1A | 0x1C | 0x20 | 0x27 | 0x37 => c.parser()?,
                 2 | 0x16 | 0x2D | 0x2E | 0x2F => {}
                 3 | 0x10 | 0x1B => {
                     c.pstr()?;
                 }
                 4 => {
                     c.label_ref()?;
-                    c.parser()?;
+                    ops.extend(c.parser_ops()?);
                 }
                 5 => {
                     c.label_ref()?;
@@ -262,7 +316,8 @@ impl Lsb {
         if c.i != data.len() {
             return Err("unexpected bytes after the last command".into());
         }
-        Ok(Lsb { version, data, texts, font_flags })
+        let menu = menu_strings(&data, &ops);
+        Ok(Lsb { version, data, texts, font_flags, menu })
     }
 
     /// LiveMaker 3 (script version 117) shows ASCII full-width unless the
@@ -281,27 +336,65 @@ impl Lsb {
     }
 
     /// The script with some text blobs replaced (index into `texts` -> new
-    /// TpWord bytes) and, if `half_width`, the font flag turned off.
-    pub fn rebuild(&self, replace: &std::collections::HashMap<usize, Vec<u8>>, half_width: bool) -> Vec<u8> {
+    /// TpWord bytes), menu strings replaced (index into `menu` -> new CP932
+    /// bytes) and, if `half_width`, the font flag turned off.
+    pub fn rebuild(
+        &self,
+        replace: &std::collections::HashMap<usize, Vec<u8>>,
+        menu: &std::collections::HashMap<usize, Vec<u8>>,
+        half_width: bool,
+    ) -> Vec<u8> {
         let mut data = self.data.clone();
         if half_width {
             for (a, b) in &self.font_flags {
                 data[*a..*b].fill(0);
             }
         }
-        let mut out = Vec::with_capacity(data.len());
-        let mut pos = 0;
+        // (start of the u32 length, end of the bytes, new bytes)
+        let mut splices: Vec<(usize, usize, &Vec<u8>)> = Vec::new();
         for (i, t) in self.texts.iter().enumerate() {
             if let Some(new) = replace.get(&i) {
-                out.extend_from_slice(&data[pos..t.start - 4]);
-                out.extend_from_slice(&(new.len() as u32).to_le_bytes());
-                out.extend_from_slice(new);
-                pos = t.end;
+                splices.push((t.start - 4, t.end, new));
             }
+        }
+        for (i, m) in self.menu.iter().enumerate() {
+            if let Some(new) = menu.get(&i) {
+                splices.push((m.start - 4, m.end, new));
+            }
+        }
+        splices.sort_by_key(|s| s.0);
+        let mut out = Vec::with_capacity(data.len());
+        let mut pos = 0;
+        for (a, b, new) in splices {
+            out.extend_from_slice(&data[pos..a]);
+            out.extend_from_slice(&(new.len() as u32).to_le_bytes());
+            out.extend_from_slice(new);
+            pos = b;
         }
         out.extend_from_slice(&data[pos..]);
         out
     }
+}
+
+fn sjis(b: &[u8]) -> String {
+    encoding_rs::SHIFT_JIS.decode(b).0.into_owned()
+}
+
+/// Choices of LiveNovel's standard selection menu (`AddArray(_tmp, "...")`)
+/// and comparisons of its result (`選択値 == "..."`) with one of them.
+fn menu_strings(data: &[u8], ops: &[Ope]) -> Vec<MenuStr> {
+    let var = |o: &(u8, usize, usize), name: &str| o.0 == PARAM_VAR && sjis(&data[o.1..o.2]) == name;
+    let mut out = Vec::new();
+    for op in ops {
+        let is_choice =
+            op.kind == OPE_FUNC && op.func == Some(FUNC_ADD_ARRAY) && op.ops.len() == 2 && var(&op.ops[0], MENU_ARRAY);
+        let is_compare = op.kind == OPE_EQUAL && op.ops.len() == 2 && var(&op.ops[0], MENU_RESULT);
+        if (is_choice || is_compare) && op.ops[1].0 == PARAM_STR {
+            let (_, a, b) = op.ops[1];
+            out.push(MenuStr { start: a, end: b, text: sjis(&data[a..b]), is_choice });
+        }
+    }
+    out
 }
 
 /// If `lp` is the expression "= 1" (one To operation with one Int or Flag

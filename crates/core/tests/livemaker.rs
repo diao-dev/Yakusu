@@ -99,7 +99,7 @@ fn lsb_and_tpword_round_trip() {
     for f in ["00000001.lsb", "gamemain.lsb"] {
         let orig = bytes(f);
         let l = Lsb::parse(orig.clone()).unwrap();
-        assert_eq!(l.rebuild(&HashMap::new(), false), orig, "{f}");
+        assert_eq!(l.rebuild(&HashMap::new(), &HashMap::new(), false), orig, "{f}");
         for i in 0..l.texts.len() {
             let tw = TpWord::parse(l.text(i)).unwrap();
             assert_eq!(tw.to_bytes(), l.text(i), "{f} text {i}");
@@ -259,7 +259,7 @@ fn half_width_fix_flips_only_the_flag() {
         let l = Lsb::parse(orig.clone()).unwrap();
         assert!(l.is_lm3());
         assert_eq!(l.has_font_flag(), want, "{operand:?}");
-        let fixed = l.rebuild(&HashMap::new(), true);
+        let fixed = l.rebuild(&HashMap::new(), &HashMap::new(), true);
         assert_eq!(fixed.len(), orig.len());
         let diff: Vec<usize> = (0..orig.len()).filter(|&i| orig[i] != fixed[i]).collect();
         assert_eq!(diff.len(), want as usize, "{operand:?}");
@@ -297,4 +297,89 @@ fn variables_inside_text_are_kept() {
     let b = again.blocks();
     let mut tw2 = again.clone();
     assert!(tw2.replace(&b[0], "Bad <v9> code").is_err());
+}
+
+fn pstr(s: &str) -> Vec<u8> {
+    let b = encoding_rs::SHIFT_JIS.encode(s).0.into_owned();
+    let mut v = (b.len() as u32).to_le_bytes().to_vec();
+    v.extend(b);
+    v
+}
+
+/// One expression operation: kind, [func], operands as (type, bytes).
+fn ope(kind: u8, func: Option<u8>, ops: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut v = 1u32.to_le_bytes().to_vec(); // one operation
+    v.push(kind);
+    v.extend(pstr("____arg"));
+    v.extend((ops.len() as u32).to_le_bytes());
+    if let Some(f) = func {
+        v.push(f);
+    }
+    for (t, b) in ops {
+        v.push(*t);
+        v.extend(b);
+    }
+    v
+}
+
+/// A script with LiveNovel's standard two-choice menu.
+fn menu_script() -> Vec<u8> {
+    let g = bytes("gamemain.lsb");
+    let (types, row) = (
+        u32::from_le_bytes(g[5..9].try_into().unwrap()) as usize,
+        u32::from_le_bytes(g[9..13].try_into().unwrap()) as usize,
+    );
+    let mut out = g[..13 + types * row].to_vec();
+    let cmd = |kind: u8, line: u32| {
+        let mut v = vec![kind, 0, 0, 0, 0, 0, 0];
+        v.extend(line.to_le_bytes());
+        v
+    };
+    let add = |s: &str| ope(0x0B, Some(0x42), &[(0, pstr("_tmp")), (4, pstr(s))]);
+    let test = |s: &str| ope(0x0C, None, &[(0, pstr("選択値")), (4, pstr(s))]);
+    out.extend(4u32.to_le_bytes());
+    for (i, c) in ["一緒に行く", "先に行く"].iter().enumerate() {
+        out.extend(cmd(0x0E, i as u32 + 1));
+        out.extend(add(c));
+    }
+    for (i, c) in ["一緒に行く", "先に行く"].iter().enumerate() {
+        out.extend(cmd(0x04, i as u32 + 3));
+        out.extend(pstr("00000002.lsb"));
+        out.extend(7u32.to_le_bytes());
+        out.extend(test(c));
+    }
+    out
+}
+
+#[test]
+fn menu_choices_and_their_jumps_change_together() {
+    let l = Lsb::parse(menu_script()).unwrap();
+    let es = livemaker::export(&l);
+    assert_eq!(es.iter().map(|e| e.message.as_str()).collect::<Vec<_>>(), vec!["一緒に行く", "先に行く"]);
+    let mut en = es.clone();
+    en[0].message = "Go together".into();
+    en[1].message = "Go ahead".into();
+    let (new, lost) = livemaker::apply(&l, &en, false).unwrap();
+    assert!(lost.is_empty());
+    let l2 = Lsb::parse(new).unwrap();
+    let texts: Vec<(&str, bool)> = l2.menu.iter().map(|m| (m.text.as_str(), m.is_choice)).collect();
+    assert_eq!(texts, vec![("Go together", true), ("Go ahead", true), ("Go together", false), ("Go ahead", false)]);
+    // Untranslated: identical bytes.
+    assert_eq!(livemaker::apply(&l, &es, false).unwrap().0, menu_script());
+}
+
+#[test]
+fn name_boxes_take_the_english_name() {
+    use yakusu_core::engines::livemaker::tpword::{Glyph, EVENT};
+    let l = Lsb::parse(bytes("00000001.lsb")).unwrap();
+    let mut tw = TpWord::parse(l.text(0)).unwrap();
+    let mut raw = vec![EVENT, 0, 0, 0, 0];
+    raw.extend(pstr("NAMELABEL\r\n桜"));
+    let at = tw.blocks()[0].start;
+    tw.glyphs.insert(at, Glyph { kind: EVENT, raw });
+    assert_eq!(tw.blocks()[0].name.as_deref(), Some("桜"));
+    assert!(tw.rename("桜", "Sakura").is_empty());
+    let again = TpWord::parse(&tw.to_bytes()).unwrap();
+    assert_eq!(again.blocks()[0].name.as_deref(), Some("Sakura"));
+    assert_eq!(again.blocks()[0].text, EXPECTED[0]);
 }

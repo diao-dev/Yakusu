@@ -347,6 +347,42 @@ impl TpWord {
     }
 }
 
+impl TpWord {
+    /// Change the speaker shown by NAMELABEL events from `old` to `new`.
+    /// Returns characters that had to be replaced with '?'.
+    pub fn rename(&mut self, old: &str, new: &str) -> Vec<char> {
+        let mut lost = Vec::new();
+        let at = if self.version >= 104 { 5 } else { 1 };
+        for g in self.glyphs.iter_mut().filter(|g| g.kind == EVENT) {
+            let Some(parts) = g.event(self.version) else { continue };
+            if parts.len() < 2 || parts[0] != "NAMELABEL" || parts[1] != old {
+                continue;
+            }
+            let mut text = format!("NAMELABEL\r\n{new}");
+            for p in &parts[2..] {
+                text.push_str("\r\n");
+                text.push_str(p);
+            }
+            let mut bytes = Vec::new();
+            for ch in text.chars() {
+                let mut buf = [0u8; 4];
+                let (enc, _, err) = encoding_rs::SHIFT_JIS.encode(ch.encode_utf8(&mut buf));
+                if err {
+                    lost.push(ch);
+                    bytes.push(b'?');
+                } else {
+                    bytes.extend_from_slice(&enc);
+                }
+            }
+            let mut raw = g.raw[..at].to_vec();
+            raw.extend((bytes.len() as u32).to_le_bytes());
+            raw.extend(bytes);
+            g.raw = raw;
+        }
+        lost
+    }
+}
+
 /// `<v12>` at the start of `s`: (12, byte length).
 fn var_code(s: &str) -> Option<(usize, usize)> {
     let inner = s.strip_prefix("<v")?;

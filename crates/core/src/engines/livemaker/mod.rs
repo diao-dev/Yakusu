@@ -75,7 +75,7 @@ pub fn detect(game_dir: &Path) -> Option<Match> {
         0.95,
         d,
         "auto",
-        "Dialogue and narration are translated. Choice menus and name boxes stay in Japanese for now.",
+        "Dialogue, narration, choice menus and name boxes are translated.",
     ))
 }
 
@@ -134,13 +134,42 @@ fn script_blocks(l: &Lsb) -> Vec<(usize, TpWord, Vec<tpword::Block>)> {
     out
 }
 
-/// The JSON entries for one script.
+/// Distinct menu choice texts in a script, in order.
+fn choices(l: &Lsb) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in l.menu.iter().filter(|m| m.is_choice && crate::protect::JP_RE.is_match(&m.text)) {
+        if !out.contains(&m.text) {
+            out.push(m.text.clone());
+        }
+    }
+    out
+}
+
+/// The JSON entries for one script: text blocks, then menu choices.
 pub fn export(l: &Lsb) -> Vec<Entry> {
-    script_blocks(l)
+    let mut out: Vec<Entry> = script_blocks(l)
         .into_iter()
         .flat_map(|(_, _, blocks)| blocks)
         .map(|b| Entry { name: b.name, names: None, message: b.text })
-        .collect()
+        .collect();
+    out.extend(choices(l).into_iter().map(|c| Entry { name: None, names: None, message: c }));
+    out
+}
+
+/// CP932 bytes for a menu string ('?' for what CP932 can't hold).
+fn cp932(s: &str, lost: &mut Vec<char>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let (enc, _, err) = encoding_rs::SHIFT_JIS.encode(ch.encode_utf8(&mut buf));
+        if err {
+            lost.push(ch);
+            out.push(b'?');
+        } else {
+            out.extend_from_slice(&enc);
+        }
+    }
+    out
 }
 
 /// Apply translated entries (same order as [`export`]) to a script.
@@ -149,7 +178,9 @@ pub fn apply(l: &Lsb, entries: &[Entry], half_width: bool) -> Result<(Vec<u8>, V
     let mut replace: HashMap<usize, Vec<u8>> = HashMap::new();
     let mut lost = Vec::new();
     let mut k = 0usize;
-    let total: usize = script_blocks(l).iter().map(|(_, _, b)| b.len()).sum();
+    let blocks_total: usize = script_blocks(l).iter().map(|(_, _, b)| b.len()).sum();
+    let menu = choices(l);
+    let total = blocks_total + menu.len();
     if entries.len() != total {
         return user(format!(
             "The translated file has {} lines but the script has {total}. Read the scripts again.",
@@ -160,17 +191,42 @@ pub fn apply(l: &Lsb, entries: &[Entry], half_width: bool) -> Result<(Vec<u8>, V
         let mut changed = false;
         let mine = &entries[k..k + blocks.len()];
         k += blocks.len();
+        let mut renames: Vec<(String, String)> = Vec::new();
         for (b, e) in blocks.iter().zip(mine).rev() {
             if e.message != b.text {
                 lost.extend(tw.replace(b, &e.message).map_err(Error::User)?);
                 changed = true;
             }
+            if let (Some(old), Some(new)) = (&b.name, &e.name) {
+                if old != new && !new.trim().is_empty() && !renames.iter().any(|(o, _)| o == old) {
+                    renames.push((old.clone(), new.clone()));
+                }
+            }
+        }
+        // The name box: NAMELABEL events take the English name.
+        for (old, new) in renames {
+            lost.extend(tw.rename(&old, &new));
+            changed = true;
         }
         if changed {
             replace.insert(i, tw.to_bytes());
         }
     }
-    Ok((l.rebuild(&replace, half_width), lost))
+    // A choice and every test of the menu's result against it get the same
+    // new text, so the game still branches the right way.
+    let new_text: HashMap<&str, &str> = menu
+        .iter()
+        .zip(&entries[blocks_total..])
+        .filter(|(c, e)| **c != e.message)
+        .map(|(c, e)| (c.as_str(), e.message.as_str()))
+        .collect();
+    let mut menu_rep: HashMap<usize, Vec<u8>> = HashMap::new();
+    for (i, m) in l.menu.iter().enumerate() {
+        if let Some(t) = new_text.get(m.text.as_str()) {
+            menu_rep.insert(i, cp932(&t.replace('\n', " "), &mut lost));
+        }
+    }
+    Ok((l.rebuild(&replace, &menu_rep, half_width), lost))
 }
 
 impl Engine for LiveMaker {
@@ -250,7 +306,7 @@ impl Engine for LiveMaker {
                 let (new, lost) = if jpath.is_file() {
                     apply(&l, &read_json_messages(&jpath)?, half_width && l.is_lm3())?
                 } else {
-                    (l.rebuild(&HashMap::new(), half_width && l.is_lm3()), vec![])
+                    (l.rebuild(&HashMap::new(), &HashMap::new(), half_width && l.is_lm3()), vec![])
                 };
                 all_lost.extend(lost);
                 if new != orig {
