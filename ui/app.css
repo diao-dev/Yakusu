@@ -198,6 +198,8 @@ code { font-family: var(--mono); font-size: 0.9em; color: var(--gold); word-brea
 .home > #manualNote { order: 7; }
 .home > #recent { order: 9; }
 .home.has-game > .picker { order: 8; margin-top: 14px; }
+.home.no-engine > #gameCard { order: 2; }
+.home.no-engine > .picker { order: 3; }
 .home .recent { margin-top: 6px; }
 .home .kept { margin-bottom: 0; }
 .home .callout { margin-top: 0; }
@@ -304,6 +306,7 @@ details.advanced summary::-webkit-details-marker { display: none; }
 .path-form .input { font-family: var(--mono), var(--jp-sans); font-size: 13.5px; }
 
 .detect .stats { margin-bottom: 0; }
+.detect-side { display: flex; align-items: center; gap: 10px; flex: none; }
 .note.reading { color: var(--accent); }
 .callout.bad { margin-top: 14px; background: var(--error-bg); border-color: var(--error-bg); }
 .callout.bad b { color: var(--error); }

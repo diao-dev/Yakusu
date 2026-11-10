@@ -363,7 +363,19 @@ pub fn run_tool(args: &[String], cx: &Ctx) -> Result<(i32, String)> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = cmd.output().map_err(|e| {
+    // "Text file busy": a tool that was only just written to disk can't be
+    // started while another thread is mid-launch. It clears in milliseconds.
+    let mut out = cmd.output();
+    for _ in 0..20 {
+        match &out {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                out = cmd.output();
+            }
+            _ => break,
+        }
+    }
+    let out = out.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::User(format!("Missing tool: {}. Reinstall Yakusu or put the tool in the tools folder.", args[0]))
         } else {

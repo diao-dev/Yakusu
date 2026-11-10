@@ -287,6 +287,18 @@
     await refresh();
     show('home');
   }
+  // Back to the empty picker. The game keeps its translations and stays in the recent list.
+  async function closeGame() {
+    await call('close');
+    estimates = null;
+    titlePickOpen = false;
+    translatorOpen = false;
+    keyStatus = null;
+    $('#kept').replaceChildren();
+    await refresh();
+    show('home');
+    $('#gamePath').value = '';
+  }
   const picker = $('#picker');
   if (TAURI && TAURI.webview) {
     // The desktop window hands over real paths for dropped folders.
@@ -308,13 +320,20 @@
     if (/^([A-Za-z]:[\\/]|\/|\\\\)/.test(t)) { $('#gamePath').value = t; safe(() => openGame(t)); }
   });
 
+  function usableGame() {
+    const p = S.project;
+    return !!(p && p.engine && p.engine.engine_id !== 'unsupported');
+  }
   function renderHome() {
     const p = S.project;
-    $('#home').classList.toggle('has-game', !!p);
+    // A folder Yakusu can't read keeps the full picker right under the explanation.
+    const usable = usableGame();
+    $('#home').classList.toggle('has-game', usable);
+    $('#home').classList.toggle('no-engine', !!p && !usable);
     $('#homeTitle').textContent = p ? p.name : 'Translate a visual novel';
     $('#homeLead').hidden = !!p;
-    picker.classList.toggle('compact', !!p);
-    $('#browseGame').textContent = p ? 'Open another game' : 'Choose game folder';
+    picker.classList.toggle('compact', usable);
+    $('#browseGame').textContent = usable ? 'Open another game' : p ? 'Choose another folder' : 'Choose game folder';
     renderGame();
     renderTranslator();
     renderRun();
@@ -357,11 +376,14 @@
     const readError = !j.running && j.action === 'extract' && j.error ? j.error : null;
     const needTitle = eng && eng.engine_id === 'kirikiri' && (titlePickOpen || (!j.running && j.need === 'title'));
     if (isTyping(box)) return;
-    if (!changed('game', [p.game_dir, eng, p.stats, p.box, p.extracted, S.matches, reading, readError, needTitle])) return;
+    if (!changed('game', [p.game_dir, eng, p.stats, p.box, p.extracted, S.matches, reading, readError, needTitle, !!j.running])) return;
     const card = h('div', { class: 'card detect' });
+    const usable = eng && eng.engine_id !== 'unsupported';
     card.append(h('div', { class: 'detect-head' },
       h('div', null, h('h2', { text: eng ? eng.name : 'Engine not recognised' }), h('div', { class: 'path', text: p.game_dir })),
-      eng ? supportBadge(eng.support) : null));
+      h('div', { class: 'detect-side' }, eng ? supportBadge(eng.support) : null,
+        h('button', { class: usable ? 'btn btn-quiet' : 'btn btn-primary', id: 'closeGame', disabled: !!j.running,
+          title: 'Close this game and pick another folder. Its translations are kept.', onclick: () => safe(closeGame) }, 'Choose a different game'))));
     if (eng && eng.note) card.append(h('p', { class: 'note', text: eng.note }));
     if (!eng) {
       const u = S.matches.find((m) => m.engine_id === 'unsupported');
@@ -473,7 +495,7 @@
   function renderTranslator() {
     const box = $('#translatorCard');
     const p = S.project;
-    if (!p) { if (changed('translator', null)) box.replaceChildren(); return; }
+    if (!usableGame()) { if (changed('translator', null)) box.replaceChildren(); return; }
     const s = S.settings;
     const ready = translatorReady();
     const open = translatorOpen || !ready;

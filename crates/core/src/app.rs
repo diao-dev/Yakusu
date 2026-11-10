@@ -188,6 +188,7 @@ impl App {
             }
             "export_csv" => self.export_csv(),
             "import_csv" => self.import_csv(s_arg(a, "text")),
+            "close" => self.close_game(),
             "forget" => self.forget(s_arg(a, "game_dir")),
             "recent" => Ok(json!(self.recent(8))),
             _ => user(format!("Unknown command {cmd}")),
@@ -1068,6 +1069,23 @@ impl App {
 
     /// Hide a game from the recent list. Its translations are kept and come
     /// back if the same folder is opened again.
+    /// Close the open game and go back to the folder picker. Nothing is
+    /// deleted: the game stays in the recent list with its translations.
+    fn close_game(&self) -> Result<Value> {
+        if self.job().running {
+            return user("Something is still running for this game. Wait for it or press Stop first.");
+        }
+        let mut i = self.inner.lock().unwrap();
+        i.project = None;
+        i.matches.clear();
+        i.settings.last_game = None;
+        self.env.save_settings(&i.settings)?;
+        drop(i);
+        // The finished job belonged to the closed game.
+        *self.job.lock().unwrap() = Job::default();
+        Ok(json!({"ok": true}))
+    }
+
     fn forget(&self, game_dir: &str) -> Result<Value> {
         if game_dir.is_empty() {
             return user("No game given.");

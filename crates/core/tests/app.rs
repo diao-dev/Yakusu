@@ -277,3 +277,24 @@ fn one_click_reads_the_scripts_when_needed() {
     }
     assert_eq!(call(&a, "state", json!({}))["project"]["translated"], 8);
 }
+
+#[test]
+fn closing_a_game_returns_to_the_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = app(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    call(&a, "open", json!({"game_dir": game}));
+    wait_job(&a);
+    call(&a, "close", json!({}));
+    let st = call(&a, "state", json!({}));
+    assert!(st["project"].is_null() && st["matches"].as_array().unwrap().is_empty());
+    assert!(st["job"]["action"].is_null());
+    // Nothing is lost: it is one click away in the recent list, already read.
+    assert_eq!(st["recent"][0]["name"], "g");
+    // And it stays closed after a restart.
+    drop(a);
+    let b = app(tmp.path());
+    assert!(call(&b, "state", json!({}))["project"].is_null());
+    call(&b, "open", json!({"game_dir": game}));
+    assert_eq!(call(&b, "state", json!({}))["project"]["total"], 8);
+}
