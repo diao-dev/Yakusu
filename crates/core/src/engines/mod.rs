@@ -15,6 +15,7 @@ pub mod asar;
 pub mod generic;
 pub mod kirikiri;
 pub mod ks;
+pub mod lcf;
 pub mod livemaker;
 pub mod manual;
 pub mod msgtool;
@@ -166,6 +167,9 @@ pub fn detect(game_dir: &Path) -> Result<Vec<Match>> {
     if let Some(m) = rgss::detect(game_dir) {
         matches.push(m);
     }
+    if let Some(m) = lcf::detect(game_dir) {
+        matches.push(m);
+    }
     if let Some(m) = unity::detect(game_dir) {
         matches.push(m);
     }
@@ -196,6 +200,7 @@ pub fn engine_for(m: &Match) -> Result<Box<dyn Engine>> {
         "tyrano" => Ok(Box::new(tyrano::Tyrano { m: m.clone() })),
         "rpgmaker" => Ok(Box::new(rpgmaker::RpgMaker { m: m.clone() })),
         "rgss" => Ok(Box::new(rgss::Rgss { m: m.clone() })),
+        "lcf" => Ok(Box::new(lcf::Lcf { m: m.clone() })),
         "unity" => Ok(Box::new(unity::Unity { m: m.clone() })),
         "scripts" => Ok(Box::new(manual::ScriptFolder { m: m.clone() })),
         id if generic::profile(id).is_some() => Ok(Box::new(generic::MsgToolEngine { m: m.clone() })),

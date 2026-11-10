@@ -139,3 +139,17 @@ fn rgss_never_panics() {
         }
     }
 }
+
+#[test]
+fn rpg_maker_2000_never_panics() {
+    use yakusu_core::engines::lcf;
+    for f in ["lcf/Map0022.lmu", "lcf/Map0015-2003.lmu"] {
+        for m in mutants(&fixture(f), 3000, 29) {
+            if let Ok(file) = lcf::read_file(&m) {
+                if let Ok(es) = lcf::export(&file) {
+                    let _ = lcf::apply(&file, &es).map(|f| lcf::write_file(&f));
+                }
+            }
+        }
+    }
+}
