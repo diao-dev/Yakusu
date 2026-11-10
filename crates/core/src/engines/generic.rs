@@ -118,11 +118,6 @@ pub const PROFILES: &[Profile] = &[
 /// Engines we recognise but can't patch automatically, with what to do instead.
 const KNOWN_UNSUPPORTED: &[(&[&str], &str, &str)] = &[
     (
-        &["Game.rgss3a", "Game.rgss2a", "Game.rgssad", "Data/*.rvdata2", "Data/*.rxdata"],
-        "RPG Maker (VX Ace / VX / XP)",
-        "This is an older RPG Maker game (VX Ace, VX or XP). Yakusu reads RPG Maker MV and MZ, but not these yet.",
-    ),
-    (
         &["Scene.pck", "Gameexe.dat"],
         "SiglusEngine",
         "SiglusEngine isn't supported yet. No open tool can rebuild its Scene.pck reliably.",

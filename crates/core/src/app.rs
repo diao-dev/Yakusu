@@ -123,7 +123,7 @@ fn describe_folder(dir: &Path) -> String {
     exes.sort();
     format!(
         "Yakusu found {} here but doesn't know this game's engine, so it can't read the script. \
-         It reads Kirikiri (.xp3), LiveMaker, TyranoScript, RPG Maker MV/MZ, Unity (Naninovel), FAVORITE (.hcb), Artemis (.pfs), BGI, YU-RIS, QLiE, Circus and Escu:de games.",
+         It reads Kirikiri (.xp3), LiveMaker, TyranoScript, RPG Maker (XP to MZ), Unity (Naninovel), FAVORITE (.hcb), Artemis (.pfs), BGI, YU-RIS, QLiE, Circus and Escu:de games.",
         exes.into_iter().take(2).collect::<Vec<_>>().join(" and ")
     )
 }

@@ -32,7 +32,7 @@ Everything else is optional: edit the style sheet and names, adjust the text box
 
 ## What it handles
 
-- **Engines:** Kirikiri (including ~500 encrypted games), LiveMaker, TyranoScript (loose, app.asar, package.nw or packed into the .exe), RPG Maker MV and MZ (messages, choices and database), Unity games made with Naninovel (experimental), FAVORITE, Artemis, BGI, YU-RIS, QLiE, Circus, Escu:de, plus CatSystem2 and Softpal with one manual step. Anything else works through *Use extracted script files instead*.
+- **Engines:** Kirikiri (including ~500 encrypted games), LiveMaker, TyranoScript (loose, app.asar, package.nw or packed into the .exe), RPG Maker XP, VX, VX Ace, MV and MZ (messages, choices and database, including encrypted .rgss archives), Unity games made with Naninovel (experimental), FAVORITE, Artemis, BGI, YU-RIS, QLiE, Circus, Escu:de, plus CatSystem2 and Softpal with one manual step. Anything else works through *Use extracted script files instead*.
 - **Quality:** a style sheet and name glossary every batch follows, a review pass by a stronger model, and a pass that rewrites lines too long for the game's text box. All of it runs from the one button.
 - **Safety:** game codes are protected and checked on every line, and checked again right before the patch is written, so a model can't slip a command into the game. Archives can't write outside their folder, backups of the originals are never overwritten, removing a patch checks every backup before touching the game, and a failed re-read keeps the previous one. Progress is saved as it goes (stop any time).
 - **Spending limit:** set a cap and Yakusu stops before a request could cross it. For models it has no price for, enter the price in Settings; it won't run a capped job it can't count.

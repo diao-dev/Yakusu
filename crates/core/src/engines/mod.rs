@@ -18,6 +18,7 @@ pub mod ks;
 pub mod livemaker;
 pub mod manual;
 pub mod msgtool;
+pub mod rgss;
 pub mod rpgmaker;
 pub mod tyrano;
 pub mod unity;
@@ -162,6 +163,9 @@ pub fn detect(game_dir: &Path) -> Result<Vec<Match>> {
     if let Some(m) = rpgmaker::detect(game_dir) {
         matches.push(m);
     }
+    if let Some(m) = rgss::detect(game_dir) {
+        matches.push(m);
+    }
     if let Some(m) = unity::detect(game_dir) {
         matches.push(m);
     }
@@ -191,6 +195,7 @@ pub fn engine_for(m: &Match) -> Result<Box<dyn Engine>> {
         "livemaker" => Ok(Box::new(livemaker::LiveMaker { m: m.clone() })),
         "tyrano" => Ok(Box::new(tyrano::Tyrano { m: m.clone() })),
         "rpgmaker" => Ok(Box::new(rpgmaker::RpgMaker { m: m.clone() })),
+        "rgss" => Ok(Box::new(rgss::Rgss { m: m.clone() })),
         "unity" => Ok(Box::new(unity::Unity { m: m.clone() })),
         "scripts" => Ok(Box::new(manual::ScriptFolder { m: m.clone() })),
         id if generic::profile(id).is_some() => Ok(Box::new(generic::MsgToolEngine { m: m.clone() })),
