@@ -118,11 +118,6 @@ pub const PROFILES: &[Profile] = &[
 /// Engines we recognise but can't patch automatically, with what to do instead.
 const KNOWN_UNSUPPORTED: &[(&[&str], &str, &str)] = &[
     (
-        &["UnityPlayer.dll", "GameAssembly.dll"],
-        "Unity",
-        "This is a Unity game. Unity keeps its text inside compiled game data in a different way for every game, so Yakusu can't read or patch it.",
-    ),
-    (
         &["Game.rgss3a", "Game.rgss2a", "Game.rgssad", "Data/*.rvdata2", "Data/*.rxdata"],
         "RPG Maker (VX Ace / VX / XP)",
         "This is an older RPG Maker game (VX Ace, VX or XP). Yakusu reads RPG Maker MV and MZ, but not these yet.",
