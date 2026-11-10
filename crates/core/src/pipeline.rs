@@ -88,7 +88,11 @@ pub fn models_for(s: &Settings) -> (String, Option<String>) {
             return (q.translate.into(), if s.review { q.review.map(String::from) } else { None });
         }
     }
-    let tm = s.translate_model.get(&s.provider).cloned().unwrap_or_default();
+    let mut tm = s.translate_model.get(&s.provider).cloned().unwrap_or_default();
+    if tm.trim().is_empty() {
+        // A provider with a known line-up works without choosing a model.
+        tm = llm::provider(&s.provider).models.first().map(|m| m.to_string()).unwrap_or_default();
+    }
     let rm = s.review_model.get(&s.provider).cloned().unwrap_or_default();
     (tm, if !rm.is_empty() && s.review { Some(rm) } else { None })
 }
@@ -460,7 +464,8 @@ impl Pipeline {
         if self.s.provider == "local" {
             return Some([0.0; 4]);
         }
-        llm::price_of(model).or_else(|| self.s.prices.get(model).map(|p| [p[0], p[1], p[0], p[0]]))
+        // A price the user entered wins: built-in prices can go out of date.
+        self.s.prices.get(model).map(|p| [p[0], p[1], p[0], p[0]]).or_else(|| llm::price_of(model))
     }
 
     /// Reserve the most a call could cost before making it, so parallel

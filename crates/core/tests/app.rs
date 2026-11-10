@@ -277,3 +277,76 @@ fn one_click_reads_the_scripts_when_needed() {
     }
     assert_eq!(call(&a, "state", json!({}))["project"]["translated"], 8);
 }
+
+#[test]
+fn closing_a_game_returns_to_the_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = app(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    call(&a, "open", json!({"game_dir": game}));
+    wait_job(&a);
+    call(&a, "close", json!({}));
+    let st = call(&a, "state", json!({}));
+    assert!(st["project"].is_null() && st["matches"].as_array().unwrap().is_empty());
+    assert!(st["job"]["action"].is_null());
+    // Nothing is lost: it is one click away in the recent list, already read.
+    assert_eq!(st["recent"][0]["name"], "g");
+    // And it stays closed after a restart.
+    drop(a);
+    let b = app(tmp.path());
+    assert!(call(&b, "state", json!({}))["project"].is_null());
+    call(&b, "open", json!({"game_dir": game}));
+    assert_eq!(call(&b, "state", json!({}))["project"]["total"], 8);
+}
+
+#[test]
+fn a_file_or_a_wrong_folder_is_handled_plainly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = app(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    // The game's .exe stands for its folder.
+    std::fs::write(game.join("game.exe"), b"MZ").unwrap();
+    call(&a, "open", json!({"game_dir": game.join("game.exe")}));
+    let st = wait_job(&a);
+    assert_eq!(st["project"]["name"], "g");
+    assert_eq!(st["project"]["total"], 8);
+    assert!(st["folder_note"].is_null());
+
+    // A folder of saves: said plainly, not just "not recognised".
+    let saves = tmp.path().join("saves");
+    std::fs::create_dir_all(&saves).unwrap();
+    std::fs::write(saves.join("save001.dat"), b"x").unwrap();
+    call(&a, "open", json!({"game_dir": saves}));
+    let st = call(&a, "state", json!({}));
+    assert!(st["folder_note"].as_str().unwrap().contains("no game .exe"), "{}", st["folder_note"]);
+
+    // Unity is named, with the reason.
+    let unity = tmp.path().join("unity");
+    std::fs::create_dir_all(unity.join("game_Data")).unwrap();
+    std::fs::write(unity.join("UnityPlayer.dll"), b"x").unwrap();
+    std::fs::write(unity.join("game.exe"), b"MZ").unwrap();
+    call(&a, "open", json!({"game_dir": unity}));
+    let st = call(&a, "state", json!({}));
+    assert_eq!(st["matches"][0]["name"], "Unity");
+
+    // A path that doesn't exist is an error, not a new empty project.
+    let r = a.call("open", &json!({"game_dir": tmp.path().join("nope")}));
+    assert!(r.is_err());
+}
+
+#[test]
+fn gemini_works_without_choosing_a_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = app(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    call(&a, "open", json!({"game_dir": game}));
+    wait_job(&a);
+    call(&a, "settings", json!({"provider": "gemini", "api_key": "AIzaTestKey1234567890"}));
+    let r = call(&a, "test_key", json!({}));
+    assert_eq!(r["model"], "gemini-3.1-flash-lite");
+    call(&a, "run", json!({"action": "auto"}));
+    let st = wait_job(&a);
+    assert!(st["job"]["error"].is_null(), "{}", st["job"]);
+    assert_eq!(st["project"]["translated"], 8);
+    assert!(st["project"]["spent"].as_f64().unwrap() > 0.0); // priced, so a spending limit works
+}
