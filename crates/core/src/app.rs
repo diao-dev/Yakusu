@@ -58,6 +58,8 @@ struct Inner {
     settings: Settings,
     project: Option<Arc<Project>>,
     matches: Vec<Match>,
+    /// What the open folder holds, said plainly, when no engine was found.
+    folder_note: Option<String>,
 }
 
 pub type Opener = Box<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
@@ -90,6 +92,42 @@ fn system_open(path: &Path) -> std::io::Result<()> {
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map(|_| ())
 }
 
+/// What a folder with no recognisable game in it holds, for the person who
+/// picked it: the Windows folder dialog shows no files, so a wrong folder
+/// looks the same as a right one.
+fn describe_folder(dir: &Path) -> String {
+    let (mut files, mut dirs, mut exes) = (0usize, 0usize, Vec::new());
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if e.path().is_dir() {
+            dirs += 1;
+        } else {
+            files += 1;
+            if name.to_lowercase().ends_with(".exe") {
+                exes.push(name);
+            }
+        }
+    }
+    let n = |c: usize, w: &str| format!("{c} {w}{}", if c == 1 { "" } else { "s" });
+    if files == 0 && dirs == 0 {
+        return "This folder is empty. Pick the folder that has the game's .exe in it.".into();
+    }
+    if exes.is_empty() {
+        return format!(
+            "This folder has {} and {}, but no game .exe, so it probably isn't the game's own folder. \
+             Pick the folder that has the game's .exe in it.",
+            n(files, "file"),
+            n(dirs, "folder")
+        );
+    }
+    exes.sort();
+    format!(
+        "Yakusu found {} here but doesn't know this game's engine, so it can't read the script. \
+         It reads Kirikiri (.xp3), FAVORITE (.hcb), Artemis (.pfs), BGI, YU-RIS, QLiE, Circus and Escu:de games.",
+        exes.into_iter().take(2).collect::<Vec<_>>().join(" and ")
+    )
+}
+
 fn s_arg<'a>(args: &'a Value, k: &str) -> &'a str {
     args.get(k).and_then(Value::as_str).unwrap_or("")
 }
@@ -110,7 +148,7 @@ impl App {
         let app = Arc::new(App {
             env,
             factory,
-            inner: Mutex::new(Inner { settings, project: None, matches: vec![] }),
+            inner: Mutex::new(Inner { settings, project: None, matches: vec![], folder_note: None }),
             logs: Arc::new(Mutex::new(VecDeque::new())),
             job: Arc::new(Mutex::new(Job::default())),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -333,6 +371,7 @@ impl App {
             let i = self.inner.lock().unwrap();
             (i.settings.clone(), i.matches.clone(), i.project.clone())
         };
+        let folder_note = self.inner.lock().unwrap().folder_note.clone();
         let keys: Map<String, Value> = settings
             .keys
             .iter()
@@ -359,6 +398,7 @@ impl App {
             "providers": llm::providers_json(),
             "prices": llm::prices_json(),
             "matches": matches,
+            "folder_note": folder_note,
             "project": proj,
             "job": job,
             "logs": logs[logs.len().saturating_sub(200)..],
@@ -461,8 +501,15 @@ impl App {
         if game_dir.trim().is_empty() {
             return user("Choose the game folder.");
         }
-        let game = abs_path(game_dir);
+        let mut game = abs_path(game_dir);
+        // The game's .exe (or any file in its folder) stands for the folder.
+        if game.is_file() {
+            if let Some(dir) = game.parent() {
+                game = dir.to_path_buf();
+            }
+        }
         let matches = engines::detect(&game)?;
+        let folder_note = if matches.is_empty() { Some(describe_folder(&game)) } else { None };
         {
             let mut j = self.job.lock().unwrap();
             if !j.running {
@@ -472,14 +519,16 @@ impl App {
         let p = Project::for_game(&self.env, &game)?;
         let top = matches.first().filter(|m| m.engine_id != "unsupported").cloned();
         p.update_meta(|m| {
-            m.hidden = false;
             if m.engine.is_none() {
                 m.engine = top;
             }
+            // A folder with no readable game doesn't belong in the recent list.
+            m.hidden = m.engine.is_none();
         })?;
         let mut i = self.inner.lock().unwrap();
         i.project = Some(Arc::new(p));
         i.matches = matches.clone();
+        i.folder_note = folder_note;
         i.settings.last_game = Some(game.to_string_lossy().to_string());
         self.env.save_settings(&i.settings)?;
         drop(i);
@@ -524,6 +573,7 @@ impl App {
         p.update_meta(|m| {
             if let Some(c) = chosen {
                 m.engine = Some(c);
+                m.hidden = false;
             }
             if let (Some(t), Some(e)) = (a.get("xp3_title"), m.engine.as_mut()) {
                 match t.as_str().filter(|s| !s.is_empty()) {
@@ -1078,6 +1128,7 @@ impl App {
         let mut i = self.inner.lock().unwrap();
         i.project = None;
         i.matches.clear();
+        i.folder_note = None;
         i.settings.last_game = None;
         self.env.save_settings(&i.settings)?;
         drop(i);

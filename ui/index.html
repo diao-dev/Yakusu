@@ -103,8 +103,11 @@
       </header>
       <div class="picker" id="picker">
         <svg class="branch" aria-hidden="true"><use href="#branch"/></svg>
-        <button class="btn btn-primary btn-lg" id="browseGame">Choose game folder</button>
-        <span class="or" id="pickerHint">or drop the folder here, or paste its path</span>
+        <div class="picker-buttons">
+          <button class="btn btn-primary btn-lg" id="browseExe">Choose the game's .exe</button>
+          <button class="btn btn-lg btn-second" id="browseGame">Choose its folder</button>
+        </div>
+        <span class="or" id="pickerHint">or drop the game's folder here, or paste its path</span>
         <form class="path-form" id="pathForm">
           <input id="gamePath" class="input" type="text" spellcheck="false" placeholder="C:\Games\さくら、もゆ。" aria-label="Game folder path">
           <button class="btn" type="submit">Open</button>

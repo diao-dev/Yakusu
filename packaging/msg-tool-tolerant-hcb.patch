@@ -1,0 +1,21 @@
+diff --git a/src/scripts/favorite/disasm.rs b/src/scripts/favorite/disasm.rs
+index b36ecb8..df3ae0e 100644
+--- a/src/scripts/favorite/disasm.rs
++++ b/src/scripts/favorite/disasm.rs
+@@ -308,11 +308,11 @@ impl Data {
+             }
+             operands
+         } else {
+-            return Err(anyhow::anyhow!(
+-                "Unknown opcode: {:#x} at {:#x}",
+-                opcode,
+-                pos
+-            ));
++            // Scripts carry stray bytes between functions that the game never
++            // runs (several are listed in OPS above). Keep an unknown byte as a
++            // one-byte instruction: it is copied back unchanged on import.
++            eprintln!("Note: unknown byte {:#x} at {:#x} kept as is", opcode, pos);
++            Vec::new()
+         };
+         Ok(Func {
+             pos,

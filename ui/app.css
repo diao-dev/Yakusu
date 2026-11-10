@@ -299,6 +299,8 @@ details.advanced summary::-webkit-details-marker { display: none; }
 .picker .or { color: var(--ink-3); font-size: 14px; }
 .picker.compact { flex-direction: row; flex-wrap: wrap; align-items: center; padding: 14px 16px; gap: 10px; border-style: solid; border-color: var(--rule); }
 .picker.compact .branch, .picker.compact .or { display: none; }
+.picker-buttons { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.picker .btn-second { background: var(--raised); color: var(--ink); border: 1px solid var(--rule-strong); font-weight: 500; }
 .picker.compact .btn-lg { min-height: 38px; padding: 0 16px; font-size: 15px; background: var(--raised); color: var(--ink); border: 1px solid var(--rule-strong); font-weight: 500; }
 .picker.compact .path-form { flex: 1; width: auto; min-width: 260px; }
 .picker .branch { position: absolute; right: -8px; top: -6px; width: 230px; opacity: .5; pointer-events: none; }

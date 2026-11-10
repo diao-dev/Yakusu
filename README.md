@@ -22,8 +22,8 @@ Windows 10 or 11 (64-bit). It uses the Edge WebView2 runtime that Windows alread
 
 ## How to use it
 
-1. **Pick the game folder.** Yakusu recognises the engine and reads the script by itself.
-2. **Paste an API key** (Claude, OpenAI, OpenRouter, or a free local model). The cost is shown before anything is spent.
+1. **Pick the game's .exe** (or its folder). Yakusu recognises the engine and reads the script by itself.
+2. **Paste an API key** (Claude, Gemini, OpenAI, OpenRouter, or a free local model). The cost is shown before anything is spent.
 3. **Press *Translate the game*.** Yakusu works out the names and tone, translates, has a second model edit every line, shortens what won't fit the text box, then builds and installs the patch. Stop whenever you like; it picks up where it left off.
 
 Not sure yet? *Try 150 lines first* installs a small test patch to check in the game. *Remove the patch* puts the original game back, byte for byte.

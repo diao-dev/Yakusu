@@ -57,6 +57,17 @@
     return null;
   }
 
+  // Picking the game's .exe is the easy way in: that dialog shows files,
+  // where the folder dialog shows every folder as if it were empty.
+  async function pickExe() {
+    if (TAURI && TAURI.dialog) {
+      const p = await TAURI.dialog.open({ directory: false, multiple: false, title: 'Choose the game\'s .exe (the file you start the game with)',
+        filters: [{ name: 'Game program', extensions: ['exe'] }, { name: 'All files', extensions: ['*'] }] });
+      return Array.isArray(p) ? p[0] : p;
+    }
+    return pickFolder();
+  }
+
   function h(tag, attrs, ...kids) {
     const el = document.createElement(tag);
     if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -158,6 +169,7 @@
   function onJobDone() {
     const j = S.job;
     if (j.need) needSetup(j.need, j.error);
+    else if (j.error && j.action === 'extract') { show('home'); toast('Couldn\'t read this game\'s scripts.', true); }
     else if (j.error) toast(j.error, true);
     else if (j.stopped) toast('Stopped. Everything translated so far is saved.');
     else if (j.action === 'auto') toast(j.result && j.result.installed ? 'Translation installed. Launch the game!' : 'Translation finished.');
@@ -254,7 +266,7 @@
   function renderBanner() {
     const j = S.job || {};
     // The game's own card explains a failed read; setup problems open their control.
-    const showIt = !j.running && j.error && bannerDismissed !== j.finished && j.need !== 'title';
+    const showIt = !j.running && j.error && bannerDismissed !== j.finished && j.need !== 'title' && j.action !== 'extract';
     $('#banner').hidden = !showIt;
     if (!showIt) return;
     $('#bannerTitle').textContent = j.need === 'key' ? 'An API key is needed' : j.need === 'model' ? 'A model is needed' :
@@ -270,7 +282,11 @@
 
   // ------------------------------------------------------------ the game
   $('#browseGame').addEventListener('click', () => safe(async () => {
-    const p = await pickFolder('Choose the game folder');
+    const p = await pickFolder('Open the game\'s folder, then press Select Folder (files are hidden in this window)');
+    if (p) await openGame(p);
+  }));
+  $('#browseExe').addEventListener('click', () => safe(async () => {
+    const p = await pickExe();
     if (p) await openGame(p);
   }));
   $('#pathForm').addEventListener('submit', (e) => {
@@ -333,7 +349,8 @@
     $('#homeTitle').textContent = p ? p.name : 'Translate a visual novel';
     $('#homeLead').hidden = !!p;
     picker.classList.toggle('compact', usable);
-    $('#browseGame').textContent = usable ? 'Open another game' : p ? 'Choose another folder' : 'Choose game folder';
+    $('#browseExe').textContent = usable ? 'Open another game' : 'Choose the game\'s .exe';
+    $('#browseGame').textContent = usable ? 'Choose a folder' : 'Choose its folder';
     renderGame();
     renderTranslator();
     renderRun();
@@ -365,6 +382,10 @@
   }
   function stat(v, l) { return h('div', { class: 'stat' }, h('b', { text: v }), h('span', { text: l })); }
 
+  function unsupportedName() {
+    const u = (S.matches || []).find((m) => m.engine_id === 'unsupported');
+    return u ? `${u.name}: not supported` : null;
+  }
   function renderGame() {
     const box = $('#gameCard');
     const p = S.project;
@@ -376,19 +397,19 @@
     const readError = !j.running && j.action === 'extract' && j.error ? j.error : null;
     const needTitle = eng && eng.engine_id === 'kirikiri' && (titlePickOpen || (!j.running && j.need === 'title'));
     if (isTyping(box)) return;
-    if (!changed('game', [p.game_dir, eng, p.stats, p.box, p.extracted, S.matches, reading, readError, needTitle, !!j.running])) return;
+    if (!changed('game', [p.game_dir, eng, p.stats, p.box, p.extracted, S.matches, S.folder_note, reading, readError, needTitle, !!j.running])) return;
     const card = h('div', { class: 'card detect' });
     const usable = eng && eng.engine_id !== 'unsupported';
     card.append(h('div', { class: 'detect-head' },
-      h('div', null, h('h2', { text: eng ? eng.name : 'Engine not recognised' }), h('div', { class: 'path', text: p.game_dir })),
+      h('div', null, h('h2', { text: eng ? eng.name : unsupportedName() || 'No game found here' }), h('div', { class: 'path', text: p.game_dir })),
       h('div', { class: 'detect-side' }, eng ? supportBadge(eng.support) : null,
         h('button', { class: usable ? 'btn btn-quiet' : 'btn btn-primary', id: 'closeGame', disabled: !!j.running,
           title: 'Close this game and pick another folder. Its translations are kept.', onclick: () => safe(closeGame) }, 'Choose a different game'))));
     if (eng && eng.note) card.append(h('p', { class: 'note', text: eng.note }));
     if (!eng) {
       const u = S.matches.find((m) => m.engine_id === 'unsupported');
-      card.append(h('p', { class: 'note', text: u ? `${u.name}: ${u.note}` :
-        'Yakusu didn\'t recognise this game\'s engine. If you have its script files extracted (for example with GARbro), translate them directly.' }));
+      card.append(h('p', { class: 'note', text: u ? u.note : (S.folder_note ||
+        'Yakusu didn\'t recognise this game\'s engine. If you have its script files extracted (for example with GARbro), translate them directly.') }));
     }
     if (needTitle) {
       card.append(titlePicker(!!det.xp3_title));
@@ -449,18 +470,20 @@
 
   // ------------------------------------------------------------ the translator
   const modelOf = (s, which) => ((s[which] || {})[s.provider] || '').trim();
+  // Providers with a known line-up (Gemini) work without choosing a model.
+  const defaultModel = (s) => ((S.providers[s.provider] || {}).models || [])[0] || '';
   function translatorReady() {
     const s = S.settings;
     if (s.provider === 'local') return true;            // the loaded model is found when the run starts
     if (!s.keys[s.provider]) return false;
-    return s.provider === 'anthropic' || !!modelOf(s, 'translate_model');
+    return s.provider === 'anthropic' || !!modelOf(s, 'translate_model') || !!defaultModel(s);
   }
   function translatorSummary() {
     const s = S.settings;
     const prov = S.providers[s.provider];
     const bits = [prov.label];
     if (s.provider === 'anthropic') bits.push((S.presets[s.preset] || {}).label || s.preset);
-    else bits.push(modelOf(s, 'translate_model') || (s.provider === 'local' ? 'whichever model is loaded' : 'no model chosen'));
+    else bits.push(modelOf(s, 'translate_model') || defaultModel(s) || (s.provider === 'local' ? 'whichever model is loaded' : 'no model chosen'));
     if (s.provider !== 'local') bits.push(s.keys[s.provider] ? `key ${s.keys[s.provider]}` : 'no key yet');
     return bits.join(' · ');
   }
@@ -555,13 +578,16 @@
     } else {
       const listId = 'modelList';
       const tm = h('input', { class: 'input', id: 'tmodel', list: listId, value: modelOf(s, 'translate_model'), autocomplete: 'off', spellcheck: 'false',
-        placeholder: s.provider === 'local' ? 'Automatic: whichever model is loaded' : 'Model ID, for example ' + ({ openai: 'gpt-5-mini', openrouter: 'google/gemini-2.5-flash' }[s.provider] || 'from your provider') });
+        placeholder: s.provider === 'local' ? 'Automatic: whichever model is loaded' : defaultModel(s) ? `${defaultModel(s)} (default)` :
+          'Model ID, for example ' + ({ openai: 'gpt-5-mini', openrouter: 'google/gemini-2.5-flash' }[s.provider] || 'from your provider') });
       tm.addEventListener('change', () => safe(async () => { await call('settings', { translate_model: tm.value }); estimates = null; await refresh(); loadEstimates(); }));
       card.append(h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'tmodel', text: 'Model' }), tm,
-        h('datalist', { id: listId }, models.map((m) => h('option', { value: m }))),
+        h('datalist', { id: listId }, (models.length ? models : prov.models || []).map((m) => h('option', { value: m }))),
         h('p', { class: 'hint', text: s.provider === 'local'
           ? 'Start the local server in LM Studio (Developer tab) or Ollama first. Local models are free but slower, and quality depends on the model.'
-          : 'A review model, prices and the API address are in Settings.' })));
+          : s.provider === 'gemini'
+            ? 'Leave it empty for the low-cost default, or pick any model your key offers. A review model and prices are in Settings.'
+            : 'A review model, prices and the API address are in Settings.' })));
     }
     box.replaceChildren(card);
     refocus();
@@ -607,7 +633,7 @@
       return h('div', { class: 'field-group' }, h('div', { class: 'label', text: `Price of ${model}` }),
         h('div', { class: 'two' }, pin, pout), h('p', { class: 'hint', text: 'In $ per million tokens: input, then output.' }));
     };
-    const tmName = modelOf(s, 'translate_model');
+    const tmName = modelOf(s, 'translate_model') || defaultModel(s);
     const rmName = modelOf(s, 'review_model');
     f.append(h('div', { class: 'field-group' }, h('div', { class: 'label', text: prov.label })),
       h('div', { class: 'field-group' }, h('label', { class: 'label', for: 'rmodel', text: 'Review model' }), rm),

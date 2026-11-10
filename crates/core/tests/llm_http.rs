@@ -338,3 +338,33 @@ fn models_are_listed_for_the_picker() {
     drop(reqs);
     assert!(llm::list_models("local", "", Some("http://127.0.0.1:9/v1")).unwrap_err().contains("LM Studio"));
 }
+
+/// Gemini goes through Google's OpenAI-compatible endpoint: low reasoning
+/// effort, room for the thinking, and no effort setting if it's refused.
+#[test]
+fn gemini_requests() {
+    let m = mock();
+    let ok = |t: &str| {
+        (
+            200,
+            json!({"choices": [{"message": {"content": t}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 9, "completion_tokens": 3}}),
+            vec![],
+        )
+    };
+    m.queue.lock().unwrap().extend([
+        ok("one"),
+        (400, json!({"error": {"message": "Invalid value for reasoning_effort"}}), vec![]),
+        ok("two"),
+    ]);
+    let c = client(&m, "gemini", "gemini-3.1-flash-lite");
+    assert_eq!(go(&c).unwrap().text, "one");
+    assert_eq!(go(&c).unwrap().text, "two");
+    let reqs = m.requests.lock().unwrap();
+    assert!(header(&reqs[0].0, "authorization").unwrap().starts_with("Bearer "));
+    assert_eq!(reqs[0].1["reasoning_effort"], "low");
+    assert_eq!(reqs[0].1["max_tokens"], 5000); // 500 asked, plus room to think
+    assert!(reqs[2].1.get("reasoning_effort").is_none());
+    drop(reqs);
+    m.queue.lock().unwrap().push((200, json!({"data": [{"id": "models/gemini-3.8-flash"}]}), vec![]));
+    assert_eq!(llm::list_models("gemini", "k", Some(&format!("{}/v1", m.url))).unwrap(), ["gemini-3.8-flash"]);
+}

@@ -16,6 +16,13 @@ pub const PRICES: &[(&str, [f64; 4])] = &[
     ("claude-haiku-5-5", [0.10, 0.50, 0.125, 0.01]),
     ("claude-sonnet-5-5", [2.00, 10.00, 2.50, 0.10]),
     ("claude-opus-5-5", [4.00, 20.00, 5.00, 0.20]),
+    // Gemini (ai.google.dev/gemini-api/docs/pricing, Nov 2026). Newer models:
+    // enter the price in Settings.
+    ("gemini-3.1-flash-lite", [0.25, 1.50, 0.25, 0.25]),
+    ("gemini-3.5-flash", [1.50, 9.00, 1.50, 1.50]),
+    ("gemini-3-flash-preview", [0.50, 3.00, 0.50, 0.50]),
+    ("gemini-2.5-flash", [0.30, 2.50, 0.30, 0.30]),
+    ("gemini-2.5-flash-lite", [0.10, 0.40, 0.10, 0.10]),
 ];
 
 pub fn price_of(model: &str) -> Option<[f64; 4]> {
@@ -61,6 +68,17 @@ pub const PROVIDERS: &[Provider] = &[
         models: &["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"],
         key_hint: "sk-ant-...",
         key_url: "https://console.anthropic.com/settings/keys",
+    },
+    Provider {
+        id: "gemini",
+        label: "Gemini (Google)",
+        // Google's OpenAI-compatible endpoint.
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        kind: "openai",
+        // The first one is used when no model has been chosen.
+        models: &["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"],
+        key_hint: "AIza...",
+        key_url: "https://aistudio.google.com/apikey",
     },
     Provider {
         id: "openai",
@@ -180,6 +198,9 @@ enum Attempt {
 struct OaParams {
     tokens_key: &'static str,
     temperature: bool,
+    /// `reasoning_effort` to ask for (Gemini thinks by default, and thinking
+    /// is billed as output). Dropped if the server refuses it.
+    effort: Option<&'static str>,
 }
 
 /// How a Claude request keeps thinking out of the way. Translation batches
@@ -269,6 +290,7 @@ impl Client {
             oa: Mutex::new(OaParams {
                 tokens_key: if is_openai { "max_completion_tokens" } else { "max_tokens" },
                 temperature: !is_openai,
+                effort: if provider == "gemini" { Some("low") } else { None },
             }),
             think: Mutex::new(Think::for_model(model)),
         }
@@ -427,16 +449,19 @@ impl Client {
             if self.api_key.is_empty() { vec![] } else { vec![("authorization", auth.as_str())] };
         let url = format!("{}/chat/completions", self.base_url);
         let mut data = None;
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut body = json!({
                 "model": self.model,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             });
             {
                 let oa = self.oa.lock().unwrap();
-                body[oa.tokens_key] = json!(max_tokens);
+                body[oa.tokens_key] = json!(self.max_output(max_tokens));
                 if oa.temperature {
                     body["temperature"] = json!(0.3);
+                }
+                if let Some(e) = oa.effort {
+                    body["reasoning_effort"] = json!(e);
                 }
             }
             match self.post(&url, &headers, &body) {
@@ -448,7 +473,9 @@ impl Client {
                     // Adapt to what this server accepts, then try again.
                     let low = m.to_lowercase();
                     let mut oa = self.oa.lock().unwrap();
-                    if low.contains("temperature") && oa.temperature {
+                    if low.contains("reasoning") && oa.effort.is_some() {
+                        oa.effort = None;
+                    } else if low.contains("temperature") && oa.temperature {
                         oa.temperature = false;
                     } else if low.contains("max_completion_tokens") && oa.tokens_key == "max_tokens" {
                         oa.tokens_key = "max_completion_tokens";
@@ -485,7 +512,8 @@ impl Llm for Client {
     }
 
     fn max_output(&self, requested: u32) -> u32 {
-        if self.kind == "anthropic" && self.think().thinks() {
+        // Gemini's thinking counts against the same limit as the answer.
+        if (self.kind == "anthropic" && self.think().thinks()) || self.provider == "gemini" {
             with_thinking_room(requested)
         } else {
             requested
@@ -560,7 +588,13 @@ pub fn list_models(provider_id: &str, api_key: &str, base_url: Option<&str>) -> 
     let mut ids: Vec<String> = v
         .get("data")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|m| m.get("id").and_then(Value::as_str)).map(String::from).collect())
+        // Gemini lists "models/gemini-..." but takes the bare name.
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str))
+                .map(|id| id.strip_prefix("models/").unwrap_or(id).to_string())
+                .collect()
+        })
         .unwrap_or_default();
     ids.dedup();
     Ok(ids)

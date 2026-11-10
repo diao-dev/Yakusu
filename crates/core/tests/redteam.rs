@@ -932,6 +932,66 @@ fn reextract_installed_favorite_keeps_original_source() {
     assert!(before.iter().zip(after.iter()).all(|(a, b)| a.jp == b.jp));
 }
 
+/// A small FAVORITE script: one helper function, then the main script with
+/// two spoken lines. With `stray`, a byte the game never runs sits between
+/// the two, as in the full release of Sakura, Moyu.
+fn synth_hcb(stray: bool) -> Vec<u8> {
+    let mut code: Vec<u8> = Vec::new(); // file offset 4 onwards
+    code.extend([0x01, 0, 0, 0x04]); // helper at 4: initstack, ret
+    if stray {
+        code.push(0x64);
+    }
+    let main = 4 + code.len() as u32;
+    code.extend([0x01, 0, 0]);
+    for line in ["春の朝が来た。", "学校へ向かった。"] {
+        let (b, _, _) = encoding_rs::SHIFT_JIS.encode(line);
+        code.push(0x0e);
+        code.push(b.len() as u8 + 1);
+        code.extend(b.iter());
+        code.push(0);
+        code.push(0x02); // call the helper
+        code.extend(4u32.to_le_bytes());
+    }
+    code.push(0x04);
+    let mut f = Vec::new();
+    f.extend((4 + code.len() as u32).to_le_bytes());
+    f.extend(code);
+    f.extend(main.to_le_bytes());
+    f.extend([0u8; 6]); // header fields
+    f.push(0); // empty title
+    f.extend(0u16.to_le_bytes()); // no system imports
+    f
+}
+
+/// msg-tool gave up on any byte it didn't know ("Unknown opcode: 0x64"),
+/// which made the whole game unreadable. The patched tool keeps the byte.
+#[test]
+fn native_favorite_script_with_a_stray_byte() {
+    for stray in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = need_real_tool!(tmp.path());
+        let game = tmp.path().join("FavoriteSynthetic");
+        fs::create_dir_all(&game).unwrap();
+        let original = synth_hcb(stray);
+        fs::write(game.join("Sakura.hcb"), &original).unwrap();
+        let pipe = pipeline(&e, &game, settings("quick", 10, 1), fake().0);
+        assert_eq!(pipe.extract().unwrap().lines, 2, "stray={stray}");
+        pipe.translate(None, false).unwrap();
+        assert_eq!(pipe.build().unwrap().applied, 2);
+        pipe.install().unwrap();
+        let patched = fs::read(game.join("Sakura.hcb")).unwrap();
+        assert_ne!(patched, original);
+        // The helper, and the stray byte after it, are where they were.
+        let keep = if stray { 9 } else { 8 };
+        assert_eq!(patched[4..keep], original[4..keep]);
+        // Both calls still point at the helper.
+        let calls = patched.windows(5).filter(|w| w == &[0x02, 4, 0, 0, 0]).count();
+        assert_eq!(calls, 2);
+        pipe.restore().unwrap();
+        assert_eq!(fs::read(game.join("Sakura.hcb")).unwrap(), original);
+    }
+}
+
 // ------------------------------------------------------------------ helpers
 
 fn zip_write(path: &Path, files: &[(&str, &[u8])]) {
