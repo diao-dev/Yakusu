@@ -18,6 +18,7 @@ pub mod ks;
 pub mod livemaker;
 pub mod manual;
 pub mod msgtool;
+pub mod rpgmaker;
 pub mod tyrano;
 pub mod xp3;
 pub mod zipped;
@@ -157,6 +158,9 @@ pub fn detect(game_dir: &Path) -> Result<Vec<Match>> {
     if let Some(m) = tyrano::detect(game_dir) {
         matches.push(m);
     }
+    if let Some(m) = rpgmaker::detect(game_dir) {
+        matches.push(m);
+    }
     for prof in generic::PROFILES {
         if let Some(m) = generic::detect_profile(game_dir, prof) {
             matches.push(m);
@@ -182,6 +186,7 @@ pub fn engine_for(m: &Match) -> Result<Box<dyn Engine>> {
         "kirikiri" => Ok(Box::new(kirikiri::Kirikiri { m: m.clone() })),
         "livemaker" => Ok(Box::new(livemaker::LiveMaker { m: m.clone() })),
         "tyrano" => Ok(Box::new(tyrano::Tyrano { m: m.clone() })),
+        "rpgmaker" => Ok(Box::new(rpgmaker::RpgMaker { m: m.clone() })),
         "scripts" => Ok(Box::new(manual::ScriptFolder { m: m.clone() })),
         id if generic::profile(id).is_some() => Ok(Box::new(generic::MsgToolEngine { m: m.clone() })),
         _ => Err(Error::User(format!("{} isn't supported. {}", m.name, m.note).trim().to_string())),

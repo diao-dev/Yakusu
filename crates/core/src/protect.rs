@@ -27,6 +27,7 @@ const CODE_PATTERNS: &[&str] = &[
     r"\[[A-Za-z_@][^\]\n]{0,160}\]",                                     // KAG tags
     r"<[A-Za-z/][^<>\n]{0,160}>",                                        // msg-tool XML-ish tags
     r"\\[A-Za-z](?:\[[^\]\n]{0,20}\]|\{[^}\n]{0,20}\}|<[^>\n]{0,20}>)?", // \c[2] escapes
+    r"\\[!.|^{}$<>]",                                                    // RPG Maker \! \. \| waits
     r"%[A-Za-z][A-Za-z0-9_]{0,15};?",                                    // %name; variables
     r"\$[A-Za-z_][A-Za-z0-9_]{0,30}",                                    // $var
     r"\{[\x20-\x7E]{1,40}\}",                                            // {var}
