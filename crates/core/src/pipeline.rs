@@ -5,7 +5,7 @@
 
 use crate::config::{Env, Settings};
 use crate::engines::{self, list_files, read_json_messages, write_json_messages, Ctx, Engine, Installer};
-use crate::error::{user, Error, Result};
+use crate::error::{setup, user, Error, Result};
 use crate::llm::{self, ClientFactory, Llm, LlmError};
 use crate::project::{now, Line, Project, ResultRow, Stats, Term};
 use crate::prompts;
@@ -97,10 +97,17 @@ pub fn client_for(s: &Settings, factory: &ClientFactory, model: &str) -> Result<
     let prov = s.provider.as_str();
     let key = s.key();
     if prov != "local" && key.is_empty() {
-        return user("Add your API key first.");
+        return setup("key", "Paste your API key first.");
     }
     if model.is_empty() {
-        return user("Choose a model first.");
+        return setup(
+            "model",
+            if prov == "local" {
+                "No model is loaded. Load one in LM Studio and start its server, then try again."
+            } else {
+                "Choose a model in Settings first."
+            },
+        );
     }
     let base = s.base_urls.get(prov).map(String::as_str).filter(|b| !b.is_empty());
     Ok(factory(prov, key, model, base))
@@ -122,6 +129,24 @@ pub struct BuildResult {
     /// Translated lines left in Japanese because they failed the final check.
     pub blocked: usize,
     pub manual_output: Option<String>,
+}
+
+/// How a run ended, for the interface.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RunSummary {
+    /// Translated lines written into the game's scripts.
+    pub applied: usize,
+    /// Translated lines left in Japanese because they'd break the game's codes.
+    pub blocked: usize,
+    /// Lines still without a usable translation.
+    pub left: usize,
+    /// Lines the model's safety system wouldn't translate.
+    pub declined: usize,
+    pub installed: bool,
+    /// Where the patched files are when the engine needs a manual step.
+    pub manual_output: Option<String>,
+    /// The whole pipeline ran (not just a test or a single stage).
+    pub complete: bool,
 }
 
 /// Everything `render` needs, gathered once per stage.
@@ -167,6 +192,34 @@ fn parse_object(text: &str) -> Result<Value> {
     }
 }
 
+/// What came back from a model call that should return a JSON array.
+enum Reply {
+    Items(Vec<Value>),
+    /// Cut off or unreadable: worth asking again in smaller pieces.
+    Unusable,
+    /// Declined by the model's safety system.
+    Refused,
+}
+
+/// What came back for a batch of lines: line number (from 1) -> English.
+enum Asked {
+    Got(HashMap<usize, String>),
+    Unusable,
+    Refused,
+}
+
+impl Asked {
+    fn into_map(self) -> HashMap<usize, String> {
+        match self {
+            Asked::Got(g) => g,
+            Asked::Unusable | Asked::Refused => HashMap::new(),
+        }
+    }
+}
+
+/// Problem recorded on a line the model's safety system wouldn't translate.
+pub const DECLINED: &str = "the model declined to translate this line";
+
 pub struct Pipeline {
     pub env: Env,
     pub p: Arc<Project>,
@@ -177,6 +230,8 @@ pub struct Pipeline {
     pub factory: ClientFactory,
     /// Worst-case cost of model calls in flight (see `reserve`).
     reserved: Mutex<f64>,
+    /// Requests the model's safety system declined during this run.
+    refused: AtomicUsize,
 }
 
 impl Pipeline {
@@ -190,6 +245,7 @@ impl Pipeline {
             cancel: Arc::new(AtomicBool::new(false)),
             factory,
             reserved: Mutex::new(0.0),
+            refused: AtomicUsize::new(0),
         }
     }
 
@@ -422,8 +478,8 @@ impl Pipeline {
                  to run without one."
             )));
         };
-        // Generous upper bound: ~3 bytes per input token, every output token used.
-        let input_tokens = (system.len() + user_msg.len()) as f64 / 3.0;
+        // Generous upper bound: ~2 bytes per input token, every output token used.
+        let input_tokens = (system.len() + user_msg.len()) as f64 / 2.0;
         let worst = (input_tokens * p[0].max(p[2]) + max_tokens as f64 * p[1]) / 1e6;
         let mut reserved = self.reserved.lock().unwrap();
         let spent = self.p.spent_total();
@@ -445,27 +501,74 @@ impl Pipeline {
     }
 
     fn call(&self, client: &dyn Llm, stage: &str, system: &str, user_msg: &str, max_tokens: u32) -> Result<String> {
-        if self.cancel.load(Ordering::SeqCst) {
-            return Err(Error::Cancelled);
-        }
         let model = client.model().to_string();
-        let held = self.reserve(&model, system, user_msg, max_tokens)?;
-        let result = client.complete(system, user_msg, max_tokens, &self.cancel);
         let cost = |u: &llm::Usage| self.price(&model).map(|p| llm::cost_at(&p, u)).unwrap_or(0.0);
-        let out = match result {
-            Ok(c) => self.p.log_cost(stage, &model, &c.usage, cost(&c.usage)).map(|_| c.text).map_err(Error::from),
-            Err(LlmError::Truncated(u)) => {
-                self.p.log_cost(stage, &model, &u, cost(&u)).map_err(Error::from).and(Err(Error::Truncated))
+        let mut max_tokens = max_tokens;
+        for attempt in 0..2 {
+            if self.cancel.load(Ordering::SeqCst) {
+                return Err(Error::Cancelled);
             }
-            Err(LlmError::Fatal(_)) if self.cancel.load(Ordering::SeqCst) => Err(Error::Cancelled),
-            Err(LlmError::Fatal(m)) => Err(Error::Llm(m)),
-        };
-        self.release(held);
-        out
+            // Reserve what is really sent: thinking models get extra room.
+            let held = self.reserve(&model, system, user_msg, client.max_output(max_tokens))?;
+            let result = client.complete(system, user_msg, max_tokens, &self.cancel);
+            let out = match result {
+                Ok(c) => self.p.log_cost(stage, &model, &c.usage, cost(&c.usage)).map(|_| c.text).map_err(Error::from),
+                Err(LlmError::NoRoom(u)) => {
+                    self.release(held);
+                    self.p.log_cost(stage, &model, &u, cost(&u))?;
+                    if attempt == 0 {
+                        // The model spent the whole limit thinking. Once more, with room to answer.
+                        max_tokens = max_tokens.saturating_mul(3).saturating_add(4000).min(32_000);
+                        continue;
+                    }
+                    return Err(Error::Truncated);
+                }
+                Err(LlmError::Truncated(u)) => {
+                    self.p.log_cost(stage, &model, &u, cost(&u)).map_err(Error::from).and(Err(Error::Truncated))
+                }
+                Err(LlmError::Refused(u)) => {
+                    self.p.log_cost(stage, &model, &u, cost(&u)).map_err(Error::from).and(Err(Error::Refused))
+                }
+                Err(LlmError::Fatal(_)) if self.cancel.load(Ordering::SeqCst) => Err(Error::Cancelled),
+                Err(LlmError::Fatal(m)) => Err(Error::Llm(m)),
+            };
+            self.release(held);
+            return out;
+        }
+        Err(Error::Truncated)
     }
 
-    /// A model call whose reply should be a JSON array. `Ok(None)` when the
-    /// reply was cut off or unreadable.
+    /// A model call whose reply should be a JSON array.
+    fn call_reply(
+        &self,
+        client: &dyn Llm,
+        stage: &str,
+        system: &str,
+        user_msg: &str,
+        max_tokens: u32,
+    ) -> Result<Reply> {
+        match self.call(client, stage, system, user_msg, max_tokens) {
+            Ok(text) => match llm::parse_json_array(&text) {
+                Ok(a) => Ok(Reply::Items(a)),
+                Err(e) => {
+                    self.log(format!("Couldn't read a reply ({e})."));
+                    Ok(Reply::Unusable)
+                }
+            },
+            Err(Error::Truncated) => {
+                self.log("A reply was cut off by the length limit.");
+                Ok(Reply::Unusable)
+            }
+            Err(Error::Refused) => {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                Ok(Reply::Refused)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Like [`Pipeline::call_reply`], for callers that treat every unusable
+    /// reply the same way: `Ok(None)` when it was cut off, unreadable or declined.
     fn call_array(
         &self,
         client: &dyn Llm,
@@ -474,20 +577,10 @@ impl Pipeline {
         user_msg: &str,
         max_tokens: u32,
     ) -> Result<Option<Vec<Value>>> {
-        match self.call(client, stage, system, user_msg, max_tokens) {
-            Ok(text) => match llm::parse_json_array(&text) {
-                Ok(a) => Ok(Some(a)),
-                Err(e) => {
-                    self.log(format!("Couldn't read a reply ({e})."));
-                    Ok(None)
-                }
-            },
-            Err(Error::Truncated) => {
-                self.log("A reply was cut off by the length limit.");
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
+        Ok(match self.call_reply(client, stage, system, user_msg, max_tokens)? {
+            Reply::Items(a) => Some(a),
+            Reply::Unusable | Reply::Refused => None,
+        })
     }
 
     // ------------------------------------------------------------ estimate
@@ -504,6 +597,14 @@ impl Pipeline {
             .p
             .with_results(|r| live.iter().filter(|l| !r.get(&l.id).map(|x| x.translated()).unwrap_or(false)).count());
         let frac = if st.lines > 0 { todo as f64 / n } else { 1.0 };
+        // Lines the editor still has to see: untranslated ones and fresh translations.
+        let to_review = self.p.with_results(|r| {
+            live.iter().filter(|l| r.get(&l.id).is_none_or(|x| !x.translated() || x.stage == "translate")).count()
+        });
+        let rfrac = if st.lines > 0 { to_review as f64 / n } else { 1.0 };
+        // A model that can't stop thinking writes (and bills) more than the answer.
+        let thinks =
+            |m: &str| if self.s.provider == "anthropic" && llm::Think::for_model(m).thinks() { 1.6 } else { 1.0 };
         let (tm, rm) = self.models();
         let bs = self.s.batch_size.max(1) as f64;
         let ctx = self.s.context_lines as f64;
@@ -518,12 +619,12 @@ impl Pipeline {
         };
         let r4 = |x: f64| (x * 1e4).round() / 1e4;
         let range = |c: Option<f64>| c.map(|c| vec![r4(c), r4(c * 1.6)]);
-        let translate = range(cost(&tm, tr_in * frac, tr_out * frac, batches * frac));
+        let translate = range(cost(&tm, tr_in * frac, tr_out * thinks(&tm) * frac, batches * frac));
         let review = match &rm {
             Some(rm) => {
                 let rv_in = chars * 1.3 + chars * 0.62 + n * 30.0;
                 let rv_out = (chars * 0.62 + n * 12.0) * 0.4;
-                range(cost(rm, rv_in, rv_out, (n / 30.0).ceil()))
+                range(cost(rm, rv_in * rfrac, rv_out * thinks(rm) * rfrac, (n / 30.0).ceil() * rfrac))
             }
             None => Some(vec![0.0, 0.0]),
         };
@@ -664,6 +765,12 @@ impl Pipeline {
             live.iter()
                 .filter(|l| want.as_ref().is_none_or(|w| w.contains(l.id.as_str())))
                 .filter(|l| redo || done.get(&l.id).is_none_or(|r| !r.good()))
+                // A line this model declined would be declined again (and
+                // take its neighbours' batch down with it): leave it until
+                // the model changes or it's retranslated by hand.
+                .filter(|l| {
+                    redo || done.get(&l.id).is_none_or(|r| r.model != tm || !r.problems.iter().any(|p| p == DECLINED))
+                })
                 .collect()
         });
         if todo.is_empty() {
@@ -754,8 +861,8 @@ impl Pipeline {
     ) -> Result<Vec<ResultRow>> {
         let prot: Vec<Arc<Protected>> = batch.iter().map(|l| self.prot(eng, l)).collect();
         let got = match self.ask_translate(client, system, batch, &prot, ctx, names, eng, "")? {
-            Some(g) => g,
-            None if batch.len() > 1 => {
+            Asked::Got(g) => g,
+            Asked::Unusable | Asked::Refused if batch.len() > 1 => {
                 let mid = batch.len() / 2;
                 self.log(format!("Splitting a batch of {} lines after an unusable reply.", batch.len()));
                 let mut first = self.translate_batch(client, system, &batch[..mid], ctx, names, eng)?;
@@ -766,7 +873,12 @@ impl Pipeline {
                 first.extend(self.translate_batch(client, system, &batch[mid..], &ctx2, names, eng)?);
                 return Ok(first);
             }
-            None => HashMap::new(),
+            // One line the model won't touch: record it and move on. It
+            // stays in Japanese until it's edited or retranslated.
+            Asked::Refused => {
+                return Ok(vec![self.row(&batch[0], "", client.model(), "translate", vec![DECLINED.into()])])
+            }
+            Asked::Unusable => HashMap::new(),
         };
         let mut rows = Vec::new();
         let mut retry: Vec<(usize, Vec<String>)> = Vec::new();
@@ -794,7 +906,7 @@ impl Pipeline {
                     eng,
                     "Some of these lines came back broken last time. Keep every placeholder.",
                 )?
-                .unwrap_or_default();
+                .into_map();
             let mut still = Vec::new();
             for (j, (k, _)) in retry.into_iter().enumerate() {
                 let en = got2.get(&(j + 1));
@@ -826,7 +938,7 @@ impl Pipeline {
         names: &IndexMap<String, String>,
         eng: &dyn Engine,
         note: &str,
-    ) -> Result<Option<HashMap<usize, String>>> {
+    ) -> Result<Asked> {
         let context: Vec<Value> = ctx
             .iter()
             .map(|l| {
@@ -852,15 +964,16 @@ impl Pipeline {
         }
         user_msg += &format!("TRANSLATE:\n{}", jsonl(&items));
         let budget = prot.iter().map(|p| p.text.chars().count()).sum::<usize>() * 3 + 60 * batch.len() + 400;
-        let Some(arr) = self.call_array(client, "translate", system, &user_msg, budget.clamp(1500, 16000) as u32)?
-        else {
-            return Ok(None);
+        let arr = match self.call_reply(client, "translate", system, &user_msg, budget.clamp(1500, 16000) as u32)? {
+            Reply::Items(arr) => arr,
+            Reply::Unusable => return Ok(Asked::Unusable),
+            Reply::Refused => return Ok(Asked::Refused),
         };
         let got: HashMap<usize, String> = arr.iter().filter_map(|o| Some((idx_of(o)?, en_of(o)))).collect();
         if got.is_empty() && !batch.is_empty() {
-            return Ok(None);
+            return Ok(Asked::Unusable);
         }
-        Ok(Some(got))
+        Ok(Asked::Got(got))
     }
 
     fn translate_single(
@@ -880,9 +993,10 @@ impl Pipeline {
         let mut en = String::new();
         for _ in 0..2 {
             let budget = (pr.text.chars().count() * 4 + 200).max(800) as u32;
-            en = match self.call_array(client, "translate", system, &user_msg, budget)? {
-                Some(arr) => arr.first().map(en_of).unwrap_or_default(),
-                None => String::new(),
+            en = match self.call_reply(client, "translate", system, &user_msg, budget)? {
+                Reply::Items(arr) => arr.first().map(en_of).unwrap_or_default(),
+                Reply::Unusable => String::new(),
+                Reply::Refused => return Ok((String::new(), vec![DECLINED.into()])),
             };
             if check(pr, Some(&en)).is_empty() {
                 return Ok((en.trim().to_string(), vec![]));
@@ -1053,6 +1167,7 @@ impl Pipeline {
         };
         let total = todo.len();
         let done = AtomicUsize::new(0);
+        let mark = self.fit_mark(b);
         let msg = "Shortening lines that overflow the text box";
         self.prog("fit", 0, total, msg);
         self.run_parallel(chunks(&todo, 30), |batch| {
@@ -1072,16 +1187,19 @@ impl Pipeline {
                     (100 * batch.len()).max(1200) as u32,
                 )?
                 .unwrap_or_default();
-            let mut rows = Vec::new();
+            let mut fixed: HashMap<usize, ResultRow> = HashMap::new();
             for o in &arr {
                 let Some(k) = idx_of(o).and_then(|i| i.checked_sub(1)).filter(|k| *k < batch.len()) else { continue };
                 let en = en_of(o);
                 if check(&prot[k], Some(&en)).is_empty() {
                     let mut r = self.row(&batch[k], &en, client.model(), "fit", vec![]);
                     r.before = Some(cur[k].en_ph.clone());
-                    rows.push(r);
+                    fixed.insert(k, r);
                 }
             }
+            // Every line asked about is marked, changed or not, so the next
+            // automatic run doesn't ask (and pay) for the same thing again.
+            let rows = (0..batch.len()).map(|k| tried_row(fixed.remove(&k), &cur[k], &mark)).collect();
             self.p.add_results(rows)?;
             let d = done.fetch_add(batch.len(), Ordering::SeqCst) + batch.len();
             self.prog("fit", d, total, msg);
@@ -1138,7 +1256,10 @@ impl Pipeline {
 
     /// Ask the editor model to fix lines that don't use the glossary's spellings.
     pub fn fix_glossary(&self) -> Result<usize> {
-        let issues = self.glossary_issues();
+        self.fix_glossary_in(self.glossary_issues())
+    }
+
+    fn fix_glossary_in(&self, issues: HashMap<String, Vec<String>>) -> Result<usize> {
         if issues.is_empty() {
             return Ok(0);
         }
@@ -1171,16 +1292,19 @@ impl Pipeline {
             let arr = self
                 .call_array(&*client, "glossary", &system, &user_msg, (120 * batch.len()).max(1500) as u32)?
                 .unwrap_or_default();
-            let mut rows = Vec::new();
+            let mut fixed: HashMap<usize, ResultRow> = HashMap::new();
             for o in &arr {
                 let Some(k) = idx_of(o).and_then(|i| i.checked_sub(1)).filter(|k| *k < batch.len()) else { continue };
                 let en = en_of(o);
                 if !en.trim().is_empty() && check(&prot[k], Some(&en)).is_empty() {
                     let mut r = self.row(&batch[k], &en, client.model(), "review", vec![]);
                     r.before = Some(cur[k].en_ph.clone());
-                    rows.push(r);
+                    fixed.insert(k, r);
                 }
             }
+            let rows = (0..batch.len())
+                .map(|k| tried_row(fixed.remove(&k), &cur[k], &glossary_mark(&issues[&batch[k].id])))
+                .collect();
             self.p.add_results(rows)?;
             let d = done.fetch_add(batch.len(), Ordering::SeqCst) + batch.len();
             self.prog("glossary", d, total, msg);
@@ -1189,18 +1313,39 @@ impl Pipeline {
         Ok(total)
     }
 
+    fn fit_mark(&self, b: &TextBox) -> String {
+        format!("fit:{}x{}", b.width, b.lines)
+    }
+
+    /// The automatic clean-up after translating: fix name spellings and
+    /// shorten lines that overflow the text box. Each line is attempted once
+    /// per problem; what the model couldn't fix is left for the Lines page
+    /// rather than paid for again on every run.
+    pub fn tidy(&self) -> Result<()> {
+        let issues: HashMap<String, Vec<String>> = self
+            .glossary_issues()
+            .into_iter()
+            .filter(|(id, miss)| self.p.result(id).is_some_and(|r| !r.tried.contains(&glossary_mark(miss))))
+            .collect();
+        if !issues.is_empty() {
+            self.fix_glossary_in(issues)?;
+        }
+        let mark = self.fit_mark(&self.render_ctx()?.text_box);
+        let over: Vec<String> = self
+            .overflow_lines()?
+            .into_iter()
+            .filter(|id| self.p.result(id).is_some_and(|r| !r.tried.contains(&mark)))
+            .collect();
+        if !over.is_empty() {
+            self.shorten(Some(over))?;
+        }
+        Ok(())
+    }
+
     /// Things worth knowing before a full run.
     pub fn preflight(&self) -> Vec<Note> {
         let mut notes = Vec::new();
         let warn = |t: String| Note { level: "warn", text: t };
-        let info = |t: String| Note { level: "info", text: t };
-        if self.s.provider != "local" && self.s.key().is_empty() {
-            notes.push(warn("Add your API key in step 2 before translating.".into()));
-        }
-        let (tm, _) = self.models();
-        if tm.is_empty() {
-            notes.push(warn("Choose a translation model in step 2.".into()));
-        }
         let (engine, built) = {
             let m = self.p.meta();
             (m.engine.clone(), m.built_at.is_some())
@@ -1213,29 +1358,11 @@ impl Pipeline {
                 if n == 1 { "" } else { "s" }
             )));
         }
-        if let Some(e) = engine.filter(|e| e.support == "experimental") {
+        if let Some(e) = engine.filter(|e| e.support == "experimental" && !built) {
             notes.push(warn(format!(
-                "{} support is experimental. Make a test patch and check it in the game before translating everything.",
+                "{} support is experimental. Try 150 lines first and check them in the game before translating everything.",
                 e.name
             )));
-        }
-        if self.p.style().trim().is_empty() {
-            notes.push(warn(
-                "No style sheet yet. Drafting one (step 3, a few cents) keeps names, tone and the narrator's voice consistent."
-                    .into(),
-            ));
-        }
-        let missing = self.missing_names().len();
-        if missing > 0 {
-            notes.push(info(format!(
-                "{missing} speaker{} no English name yet. Yakusu will name them before translating.",
-                if missing == 1 { " has" } else { "s have" }
-            )));
-        }
-        if !built {
-            notes.push(info(
-                "You haven't made a test patch. It's the cheapest way to check that text shows up correctly in this game.".into(),
-            ));
         }
         let est = self.estimate();
         let cap = self.s.budget_usd;
@@ -1366,6 +1493,114 @@ impl Pipeline {
         })
     }
 
+    /// The scripts have been read into the project.
+    pub fn is_read(&self) -> bool {
+        self.p.meta().stats.is_some() && !self.p.lines().is_empty()
+    }
+
+    /// Read the game's scripts unless that's already done.
+    pub fn ensure_read(&self) -> Result<()> {
+        if !self.is_read() {
+            self.extract()?;
+        }
+        Ok(())
+    }
+
+    /// Lines without a usable translation, and how many of them the model declined.
+    pub fn unfinished(&self) -> (usize, usize) {
+        let live = self.live_lines();
+        self.p.with_results(|res| {
+            let (mut left, mut declined) = (0, 0);
+            for l in &live {
+                match res.get(&l.id) {
+                    Some(r) if r.good() => {}
+                    Some(r) if r.problems.iter().any(|p| p == DECLINED) => {
+                        left += 1;
+                        declined += 1;
+                    }
+                    _ => left += 1,
+                }
+            }
+            (left, declined)
+        })
+    }
+
+    /// Build the patch and put it in the game. Engines that need a manual
+    /// step stop after building: the patched files are in `manual_output`.
+    pub fn finish(&self) -> Result<RunSummary> {
+        let b = self.build()?;
+        let staged = !list_files(&self.p.work("out"), None).is_empty();
+        let installed = if staged || b.manual_output.is_none() {
+            self.install()?;
+            true
+        } else {
+            self.log(format!(
+                "This engine needs one manual step: the patched script files are in {}.",
+                b.manual_output.as_deref().unwrap_or_default()
+            ));
+            false
+        };
+        let (left, declined) = self.unfinished();
+        Ok(RunSummary {
+            applied: b.applied,
+            blocked: b.blocked,
+            left,
+            declined,
+            installed,
+            manual_output: b.manual_output,
+            complete: false,
+        })
+    }
+
+    /// The whole job in one go: read the scripts if needed, draft the style
+    /// sheet and names if there are none, translate, review, fix name
+    /// spellings, shorten what overflows the text box, build and install.
+    /// Every stage picks up where an earlier run stopped.
+    pub fn run_all(&self) -> Result<RunSummary> {
+        // Fail on a missing key or model before any work is done.
+        let (tm, rm) = self.models();
+        self.client(&tm)?;
+        self.ensure_read()?;
+        if self.p.style().trim().is_empty() {
+            match self.draft_style() {
+                Ok(_) => {}
+                Err(e @ (Error::Llm(_) | Error::Budget(_) | Error::Cancelled | Error::Setup { .. })) => return Err(e),
+                // A style sheet helps but isn't required: names are still
+                // translated consistently (see `ensure_names`).
+                Err(e) => self.log(format!("Went on without a style sheet ({e})")),
+            }
+        }
+        self.translate(None, false)?;
+        if rm.is_some() {
+            self.review(None)?;
+        }
+        self.tidy()?;
+        let mut sum = self.finish()?;
+        sum.complete = true;
+        if sum.declined > 0 {
+            self.log(format!(
+                "The model declined {} line{}; they stay in Japanese. Open Lines > Problems to edit them, or switch \
+                 to another model in Settings and translate again.",
+                fmt_n(sum.declined),
+                if sum.declined == 1 { "" } else { "s" }
+            ));
+        }
+        self.log(if sum.installed {
+            "Done. The translation is installed. Launch the game!"
+        } else {
+            "Done. The translated scripts are ready."
+        });
+        Ok(sum)
+    }
+
+    /// Translate just `ids` (the start of one script), build and install,
+    /// to check how the text looks in the game before paying for all of it.
+    pub fn run_test(&self, ids: &[String]) -> Result<RunSummary> {
+        self.client(&self.models().0)?;
+        self.translate(Some(ids), false)?;
+        self.finish()
+    }
+
     pub fn install(&self) -> Result<Vec<String>> {
         let mut eng = self.engine()?;
         if let Some(manual) = eng.m().str("manual_output") {
@@ -1439,6 +1674,26 @@ impl Pipeline {
     pub fn work_dir(&self) -> PathBuf {
         self.p.work("")
     }
+}
+
+fn glossary_mark(missing: &[String]) -> String {
+    format!("glossary:{}", missing.join("|"))
+}
+
+/// The row to store for a line an automatic fix was attempted on: the fixed
+/// row if there is one, else the current row again, either way remembering
+/// the attempt.
+fn tried_row(fixed: Option<ResultRow>, current: &ResultRow, mark: &str) -> ResultRow {
+    let mut r = fixed.unwrap_or_else(|| {
+        let mut same = current.clone();
+        same.t = 0.0; // stamped again when stored
+        same
+    });
+    r.tried = current.tried.clone();
+    if !r.tried.iter().any(|m| m == mark) {
+        r.tried.push(mark.to_string());
+    }
+    r
 }
 
 /// 12345 -> "12,345"

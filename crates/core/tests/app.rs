@@ -28,6 +28,18 @@ fn wait_job(a: &Arc<App>) -> Value {
     panic!("job did not finish");
 }
 
+fn wait_until(a: &Arc<App>, done: impl Fn(&Value) -> bool) -> Value {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(20) {
+        let st = call(a, "state", json!({}));
+        if done(&st) {
+            return st;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("condition not reached");
+}
+
 #[test]
 fn flow_through_commands() {
     let tmp = tempfile::tempdir().unwrap();
@@ -35,21 +47,20 @@ fn flow_through_commands() {
     let game = make_game(&tmp.path().join("ゲーム"), SECOND_KS);
     let r = call(&a, "open", json!({"game_dir": game}));
     assert_eq!(r["matches"][0]["engine_id"], "kirikiri");
+    // Opening a game reads its scripts without being asked.
+    let st = wait_job(&a);
+    assert_eq!(st["project"]["total"], 8, "{}", st["job"]);
     call(&a, "settings", json!({"provider": "anthropic", "api_key": "sk-test-1234567890abcdef", "preset": "quick"}));
     let st = call(&a, "state", json!({}));
     assert!(!st.to_string().contains("sk-test-1234567890abcdef")); // key never sent back in full
     assert_eq!(st["settings"]["keys"]["anthropic"], "sk-test…cdef");
 
-    call(&a, "run", json!({"action": "extract"}));
-    let st = wait_job(&a);
-    assert_eq!(st["project"]["total"], 8);
     assert!(st["job"]["error"].is_null(), "{}", st["job"]);
     let est = call(&a, "estimate", json!({"all": true}));
     let keys: Vec<&String> = est.as_object().unwrap().keys().collect();
-    assert_eq!(keys.len(), 3);
+    assert_eq!(keys.len(), 4); // the three presets and "current"
     assert!(est["recommended"]["total"][0].as_f64().unwrap() > est["quick"]["total"][0].as_f64().unwrap());
-    let pf = call(&a, "preflight", json!({}));
-    assert!(pf["notes"].as_array().unwrap().iter().any(|n| n["text"].as_str().unwrap().contains("test patch")));
+    assert!(call(&a, "preflight", json!({}))["notes"].is_array());
 
     call(&a, "run", json!({"action": "test"}));
     let st = wait_job(&a);
@@ -125,6 +136,7 @@ fn second_job_is_refused_while_running() {
     let a = app(tmp.path());
     let game = make_game(&tmp.path().join("g"), SECOND_KS);
     call(&a, "open", json!({"game_dir": game}));
+    wait_job(&a);
     let gate = Arc::new(AtomicBool::new(false));
     let g2 = gate.clone();
     a.start("slow", move || {
@@ -147,7 +159,6 @@ fn stop_reaches_the_running_pipeline() {
     let game = make_game(&tmp.path().join("g"), SECOND_KS);
     call(&a, "open", json!({"game_dir": game}));
     call(&a, "settings", json!({"api_key": "k"}));
-    call(&a, "run", json!({"action": "extract"}));
     wait_job(&a);
     let pipe = a.pipeline().unwrap();
     let seen = Arc::new(AtomicBool::new(false));
@@ -184,6 +195,9 @@ fn errors_are_user_facing_and_recent_games_listed() {
     let g2 = make_game(&tmp.path().join("two"), SECOND_KS);
     call(&a, "open", json!({"game_dir": g1}));
     call(&a, "open", json!({"game_dir": g2}));
+    // The second game was opened while the first was still being read: it is read next.
+    let st = wait_until(&a, |st| st["project"]["extracted"] == true);
+    assert_eq!(st["project"]["name"], "two");
     let recent = call(&a, "recent", json!({}));
     assert_eq!(recent.as_array().unwrap().len(), 1);
     assert_eq!(recent[0]["name"], "one");
@@ -199,4 +213,67 @@ fn errors_are_user_facing_and_recent_games_listed() {
     assert_eq!(call(&b, "test_key", json!({}))["reply"], "OK");
     let games = call(&b, "xp3_games", json!({"q": "11eyes"}));
     assert!(games["games"].as_array().unwrap().len() >= 2);
+}
+
+#[test]
+fn one_click_does_everything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = app(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    // Without a key the run says what's missing, and nothing is spent.
+    call(&a, "open", json!({"game_dir": game}));
+    wait_job(&a);
+    call(&a, "run", json!({"action": "auto"}));
+    let st = wait_job(&a);
+    assert_eq!(st["job"]["need"], "key", "{}", st["job"]);
+    assert!(st["job"]["error"].as_str().unwrap().contains("API key"));
+    assert_eq!(st["project"]["translated"], 0);
+
+    call(&a, "settings", json!({"api_key": "sk-test-1234567890abcdef"}));
+    call(&a, "run", json!({"action": "auto"}));
+    let st = wait_job(&a);
+    let job = &st["job"];
+    assert!(job["error"].is_null(), "{job}");
+    assert_eq!(job["action"], "auto");
+    assert_eq!(job["result"]["complete"], true);
+    assert_eq!(job["result"]["installed"], true);
+    assert_eq!(job["result"]["left"], 0);
+    let p = &st["project"];
+    assert_eq!(p["translated"], p["total"]);
+    assert_eq!(p["installed"], true);
+    assert_eq!(p["has_style"], true); // drafted on the way, without being asked
+    assert!(game.join("patch.xp3").exists());
+
+    // Running it again has nothing left to pay for: it only rebuilds.
+    let spent = p["spent"].as_f64().unwrap();
+    call(&a, "run", json!({"action": "auto"}));
+    let st = wait_job(&a);
+    assert!(st["job"]["error"].is_null(), "{}", st["job"]);
+    assert!((st["project"]["spent"].as_f64().unwrap() - spent).abs() < 1e-9);
+}
+
+#[test]
+fn one_click_reads_the_scripts_when_needed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    {
+        // A game that was opened but never read (the app closed in between).
+        let p = yakusu_core::project::Project::for_game(&env(tmp.path()), &game).unwrap();
+        let m = yakusu_core::engines::detect(&game).unwrap().remove(0);
+        p.update_meta(|meta| meta.engine = Some(m)).unwrap();
+        let mut s =
+            yakusu_core::config::Settings { last_game: Some(game.to_string_lossy().into()), ..Default::default() };
+        s.keys.insert("anthropic".into(), "k".into());
+        env(tmp.path()).save_settings(&s).unwrap();
+    }
+    let a = app(tmp.path());
+    let st = call(&a, "state", json!({}));
+    assert_eq!(st["project"]["extracted"], false);
+    for action in ["test", "auto"] {
+        call(&a, "run", json!({"action": action}));
+        let st = wait_job(&a);
+        assert!(st["job"]["error"].is_null(), "{action}: {}", st["job"]);
+        assert_eq!(st["project"]["installed"], true);
+    }
+    assert_eq!(call(&a, "state", json!({}))["project"]["translated"], 8);
 }

@@ -11,7 +11,7 @@ use super::{
     clean_dir, join_rel, ks, list_files, msgtool, read_json_messages, write_json_messages, xp3, Ctx, Engine, Installer,
     Match,
 };
-use crate::error::{user, Error, Result};
+use crate::error::{setup, user, Error, Result};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -301,10 +301,13 @@ impl Engine for Kirikiri {
                         title = Some(t);
                     }
                     None => {
-                        return user(format!(
-                            "{arc} is encrypted and Yakusu couldn't tell which game this is. \
-                             Pick the game from the list on the Game step and Yakusu will read the scripts again."
-                        ))
+                        return setup(
+                            "title",
+                            format!(
+                                "{arc} is encrypted and Yakusu couldn't tell which game this is. \
+                                 Pick the game from the list and Yakusu will read the scripts again."
+                            ),
+                        )
                     }
                 }
             }
@@ -337,12 +340,15 @@ impl Engine for Kirikiri {
             let examples = garbled.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
             let from_encrypted = garbled.iter().any(|r| origin.get(r).is_some_and(|a| !plain_archives.contains(a)));
             return match (&title, from_encrypted) {
-                (Some(t), true) => user(format!(
-                    "{} of {found} scripts didn't decrypt into readable text with the profile for \"{t}\" \
-                     (for example {examples}). The game probably needs a different profile: pick the exact game and \
-                     edition from the list on the Game step, then read the scripts again.",
-                    garbled.len()
-                )),
+                (Some(t), true) => setup(
+                    "title",
+                    format!(
+                        "{} of {found} scripts didn't decrypt into readable text with the profile for \"{t}\" \
+                         (for example {examples}). The game probably needs a different profile: pick the exact game \
+                         and edition from the list.",
+                        garbled.len()
+                    ),
+                ),
                 _ => user(format!(
                     "{} of {found} scripts aren't readable text (for example {examples}). They may be damaged, or \
                      encrypted in a way Yakusu can't read.",

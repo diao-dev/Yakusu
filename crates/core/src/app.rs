@@ -33,6 +33,13 @@ pub struct Job {
     pub finished: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What the user has to set up to get past `error`: "key", "model" or
+    /// "title" (which Kirikiri game this is).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub need: Option<String>,
+    /// The game folder this job works on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +164,7 @@ impl App {
                 Ok(json!({"games": games}))
             }
             "open" => self.open_game(s_arg(a, "game_dir"), false),
+            "models" => self.models(),
             "engine" => self.set_engine(a),
             "settings" => self.save_settings(a),
             "test_key" => self.test_key(),
@@ -252,6 +260,7 @@ impl App {
 
     /// Run `f` as the background job. Only one job runs at a time.
     pub fn start(self: &Arc<Self>, action: &str, f: impl FnOnce() -> Result<Value> + Send + 'static) -> Result<Value> {
+        let game = self.project().map(|p| p.meta().game_dir.clone());
         {
             let mut j = self.job.lock().unwrap();
             if j.running {
@@ -261,6 +270,7 @@ impl App {
             self.cancel.store(false, Ordering::SeqCst);
             *j = Job {
                 running: true,
+                game: game.clone(),
                 action: Some(action.into()),
                 stage: Some(action.into()),
                 started: Some(now()),
@@ -271,30 +281,41 @@ impl App {
         let app = self.clone();
         std::thread::spawn(move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-            let mut j = app.job.lock().unwrap();
-            j.running = false;
-            j.finished = Some(now());
-            match r {
-                Ok(Ok(v)) => j.result = Some(v),
-                Ok(Err(Error::Cancelled)) => {
-                    j.stopped = true;
-                    drop(j);
-                    app.log("Stopped. Everything translated so far is saved.");
+            let mut log = None;
+            {
+                let mut j = app.job.lock().unwrap();
+                j.running = false;
+                j.finished = Some(now());
+                match r {
+                    Ok(Ok(v)) => j.result = Some(v),
+                    Ok(Err(Error::Cancelled)) => {
+                        j.stopped = true;
+                        log = Some("Stopped. Everything translated so far is saved.".to_string());
+                    }
+                    Ok(Err(e)) => {
+                        let msg = e.to_string();
+                        j.error = Some(msg.clone());
+                        j.need = e.need().map(String::from);
+                        log = Some(format!("Error: {msg}"));
+                    }
+                    Err(p) => {
+                        let msg = p
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()));
+                        let msg = format!("Unexpected error: {}", msg.unwrap_or_default());
+                        j.error = Some(msg.clone());
+                        log = Some(msg);
+                    }
                 }
-                Ok(Err(e)) => {
-                    let msg = e.to_string();
-                    j.error = Some(msg.clone());
-                    drop(j);
-                    app.log(&format!("Error: {msg}"));
-                }
-                Err(p) => {
-                    let msg =
-                        p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()));
-                    let msg = format!("Unexpected error: {}", msg.unwrap_or_default());
-                    j.error = Some(msg.clone());
-                    drop(j);
-                    app.log(&msg);
-                }
+            }
+            if let Some(m) = log {
+                app.log(&m);
+            }
+            // A game opened while this job was busy with another one
+            // couldn't be read then: read it now.
+            if app.project().map(|p| p.meta().game_dir.clone()) != game {
+                app.read_if_needed();
             }
         });
         Ok(json!({"started": action}))
@@ -432,7 +453,10 @@ impl App {
     }
 
     // ------------------------------------------------------------ actions
-    pub fn open_game(&self, game_dir: &str, quiet: bool) -> Result<Value> {
+    /// Open a game folder. Unless `quiet` (start-up), the scripts are read
+    /// right away when that hasn't been done yet, so there is nothing to
+    /// press between choosing the folder and translating.
+    pub fn open_game(self: &Arc<Self>, game_dir: &str, quiet: bool) -> Result<Value> {
         if game_dir.trim().is_empty() {
             return user("Choose the game folder.");
         }
@@ -463,11 +487,27 @@ impl App {
                 Some(m) => self.log(&format!("Opened {}: looks like {}.", game.display(), m.name)),
                 None => self.log(&format!("Opened {}: engine not recognized.", game.display())),
             }
+            self.read_if_needed();
         }
         Ok(json!({"matches": matches}))
     }
 
-    fn set_engine(&self, a: &Value) -> Result<Value> {
+    /// Start reading the scripts if the open game has a usable engine and
+    /// hasn't been read yet. Quietly does nothing otherwise.
+    fn read_if_needed(self: &Arc<Self>) {
+        let Some(p) = self.project() else { return };
+        let ready = {
+            let m = p.meta();
+            m.stats.is_none() && m.engine.as_ref().is_some_and(|e| engines::engine_for(e).is_ok())
+        };
+        if ready {
+            let _ = self.run_action("extract");
+        }
+    }
+
+    /// Choose another engine, a folder of extracted scripts, or the game
+    /// title for decryption. The scripts are then read (again) with it.
+    fn set_engine(self: &Arc<Self>, a: &Value) -> Result<Value> {
         let p = self.need_project()?;
         let matches = self.inner.lock().unwrap().matches.clone();
         let chosen = if !s_arg(a, "scripts_folder").is_empty() {
@@ -491,7 +531,50 @@ impl App {
                 }
             }
         })?;
+        // Clearing the title only opens the picker again; anything else is
+        // a new way to read this game, so read it now.
+        let cleared_title = a.get("xp3_title").is_some_and(|t| t.as_str().is_none_or(str::is_empty));
+        if !cleared_title && !self.job().running {
+            let _ = self.run_action("extract");
+        }
         Ok(json!({"ok": true}))
+    }
+
+    /// For a local server, use the model that's loaded when none was typed
+    /// in. Says what to do when the server isn't running or has no model.
+    fn ensure_local_model(&self) -> Result<()> {
+        let s = self.settings();
+        if s.provider != "local" || s.translate_model.get("local").is_some_and(|m| !m.trim().is_empty()) {
+            return Ok(());
+        }
+        let base = s.base_urls.get("local").map(String::as_str);
+        let models = match llm::list_models("local", "", base) {
+            Ok(m) => m,
+            Err(e) => return Err(Error::Setup { need: "model", msg: e }),
+        };
+        let Some(first) = models.into_iter().find(|m| !m.to_lowercase().contains("embed")) else {
+            return Err(Error::Setup {
+                need: "model",
+                msg: "The local server is running but has no model loaded. Load one in LM Studio, then try again."
+                    .into(),
+            });
+        };
+        let mut i = self.inner.lock().unwrap();
+        i.settings.translate_model.insert("local".into(), first.clone());
+        let _ = self.env.save_settings(&i.settings);
+        drop(i);
+        self.log(&format!("Using the local model {first}."));
+        Ok(())
+    }
+
+    /// The models the current provider offers (for the model picker).
+    fn models(&self) -> Result<Value> {
+        let s = self.settings();
+        let base = s.base_urls.get(&s.provider).map(String::as_str);
+        match llm::list_models(&s.provider, s.key(), base) {
+            Ok(m) => Ok(json!({"models": m})),
+            Err(e) => Err(Error::Llm(e)),
+        }
     }
 
     fn save_settings(&self, a: &Value) -> Result<Value> {
@@ -560,14 +643,19 @@ impl App {
         Ok(json!({"ok": true}))
     }
 
+    /// Check that the saved key and model answer a request.
     fn test_key(&self) -> Result<Value> {
+        self.ensure_local_model()?;
         let s = self.settings();
         let (tm, _) = pipeline::models_for(&s);
         let client = pipeline::client_for(&s, &self.factory, &tm)?;
         let cancel = AtomicBool::new(false);
-        match client.complete("Reply with the single word OK.", "Say OK.", 10, &cancel) {
+        match client.complete("Reply with the single word OK.", "Say OK.", 200, &cancel) {
             Ok(c) => Ok(json!({"ok": true, "reply": c.text.trim().chars().take(40).collect::<String>(), "model": tm})),
-            Err(llm::LlmError::Truncated(_)) => Ok(json!({"ok": true, "reply": "", "model": tm})),
+            // Any reply at all means the key and the model work.
+            Err(llm::LlmError::Truncated(_) | llm::LlmError::NoRoom(_) | llm::LlmError::Refused(_)) => {
+                Ok(json!({"ok": true, "reply": "", "model": tm}))
+            }
             Err(llm::LlmError::Fatal(m)) => Err(Error::Llm(m)),
         }
     }
@@ -754,7 +842,9 @@ impl App {
         Ok(json!({"ok": true}))
     }
 
-    fn test_ids(&self, pipe: &Pipeline) -> (Vec<String>, Option<String>) {
+    /// The lines a test patch translates: the first 150 of the chosen
+    /// script, or of the first script with enough text.
+    fn test_ids(pipe: &Pipeline) -> (Vec<String>, Option<String>) {
         let live = pipe.live_lines();
         let mut f = pipe.p.meta().test_file.clone();
         if f.as_ref().is_none_or(|f| !live.iter().any(|l| &l.file == f)) {
@@ -771,55 +861,45 @@ impl App {
     }
 
     fn run_action(self: &Arc<Self>, action: &str) -> Result<Value> {
+        if self.job().running {
+            return user("Something is already running. Wait for it or press Stop.");
+        }
+        if !matches!(action, "extract" | "build" | "refit" | "restore") {
+            self.ensure_local_model()?;
+        }
         let pipe = self.pipeline()?;
         let app = self.clone();
         match action {
             "extract" => self.start(action, move || Ok(json!(pipe.extract()?))),
-            "style" => self.start(action, move || pipe.draft_style()),
-            "test" => {
-                let (ids, f) = self.test_ids(&pipe);
-                self.start(action, move || {
-                    pipe.translate(Some(&ids), false)?;
-                    pipe.build()?;
-                    pipe.install()?;
-                    app.log(&format!(
-                        "Test patch installed: the first {} lines of {}. Launch the game to check them.",
-                        ids.len(),
-                        f.unwrap_or_default()
-                    ));
-                    Ok(json!({"test": ids.len()}))
-                })
-            }
-            "refit" => self.start(action, move || {
-                pipe.build()?;
-                pipe.install()?;
-                app.log("Rebuilt with the new text box settings.");
-                Ok(json!({}))
+            // Everything, start to finish. "full" is the name older builds used.
+            "auto" | "full" => self.start("auto", move || Ok(json!(pipe.run_all()?))),
+            "test" => self.start(action, move || {
+                pipe.ensure_read()?;
+                let (ids, f) = Self::test_ids(&pipe);
+                let sum = pipe.run_test(&ids)?;
+                app.log(&format!(
+                    "Test patch {}: the first {} lines of {}. Launch the game to check them.",
+                    if sum.installed { "installed" } else { "built" },
+                    ids.len(),
+                    f.unwrap_or_default()
+                ));
+                let mut v = json!(sum);
+                v["test"] = json!(ids.len());
+                Ok(v)
             }),
-            "full" => self.start(action, move || {
-                pipe.translate(None, false)?;
-                if pipe.models().1.is_some() {
-                    pipe.review(None)?;
-                }
-                if !pipe.glossary_issues().is_empty() {
-                    pipe.fix_glossary()?;
-                }
-                if !pipe.overflow_lines()?.is_empty() {
-                    pipe.shorten(None)?;
-                }
-                let b = pipe.build()?;
-                pipe.install()?;
-                app.log("Done. The translation is installed. Launch the game!");
-                Ok(json!({"applied": b.applied, "complete": true}))
+            "style" => self.start(action, move || {
+                pipe.ensure_read()?;
+                pipe.draft_style()
+            }),
+            "refit" => self.start(action, move || {
+                let sum = pipe.finish()?;
+                app.log("Rebuilt with the new text box settings.");
+                Ok(json!(sum))
             }),
             "translate" => self.start(action, move || Ok(json!(pipe.translate(None, false)?))),
             "review" => self.start(action, move || Ok(json!(pipe.review(None)?))),
             "fit" => self.start(action, move || Ok(json!(pipe.shorten(None)?))),
-            "build" => self.start(action, move || {
-                let b = pipe.build()?;
-                pipe.install()?;
-                Ok(json!(b))
-            }),
+            "build" => self.start(action, move || Ok(json!(pipe.finish()?))),
             "restore" => self.start(action, move || {
                 pipe.restore()?;
                 Ok(json!({}))
@@ -830,10 +910,11 @@ impl App {
     }
 
     fn retranslate(self: &Arc<Self>, ids: Vec<String>) -> Result<Value> {
-        let pipe = self.pipeline()?;
         if ids.is_empty() {
             return user("Pick at least one line.");
         }
+        self.ensure_local_model()?;
+        let pipe = self.pipeline()?;
         let installed = pipe.installed();
         let app = self.clone();
         self.start("retranslate", move || {
@@ -842,8 +923,7 @@ impl App {
                 pipe.review(Some(&ids))?;
             }
             if installed {
-                pipe.build()?;
-                pipe.install()?;
+                pipe.finish()?;
             }
             app.log(&format!("Retranslated {} line{}.", ids.len(), if ids.len() == 1 { "" } else { "s" }));
             Ok(json!({}))
@@ -864,6 +944,8 @@ impl App {
                     Pipeline::new(self.env.clone(), p.clone(), s, self.factory.clone()).estimate(),
                 );
             }
+            // And for the settings as they are (any provider).
+            out.insert("current".into(), self.pipeline()?.estimate());
             return Ok(Value::Object(out));
         }
         Ok(self.pipeline()?.estimate())

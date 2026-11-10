@@ -84,6 +84,10 @@ fn anthropic_request_shape_and_cost() {
     assert_eq!(header(h, "anthropic-version"), Some(llm::ANTHROPIC_VERSION));
     assert_eq!(body["system"][0]["cache_control"], json!({"type": "ephemeral"}));
     assert_eq!(body["messages"], json!([{"role": "user", "content": "USER"}]));
+    // Current Claude models reject sampling parameters outright.
+    for k in ["temperature", "top_p", "top_k"] {
+        assert!(body.get(k).is_none(), "{k} must not be sent");
+    }
     assert_eq!(c.usage, llm::Usage { input: 100, output: 20, cache_write: 0, cache_read: 50 });
     assert!((c.usd.unwrap() - (100.0 * 0.10 + 20.0 * 0.50 + 50.0 * 0.01) / 1e6).abs() < 1e-12);
 }
@@ -204,4 +208,133 @@ fn parse_json_array_tolerates_fences_and_thinking() {
     assert_eq!(llm::parse_json_array("```json\n[{\"i\":1}]\n```").unwrap(), vec![json!({"i": 1})]);
     assert_eq!(llm::parse_json_array("<think>[nope]</think>Sure: [{\"i\":2}] done").unwrap(), vec![json!({"i": 2})]);
     assert!(llm::parse_json_array("no array here").is_err());
+}
+
+/// Each Claude family turns thinking down its own way; none gets `temperature`.
+#[test]
+fn claude_thinking_is_kept_out_of_the_way() {
+    let m = mock();
+    for (model, thinking, effort, max_tokens) in [
+        ("claude-haiku-5-5", json!({"type": "disabled"}), Value::Null, 500),
+        ("claude-sonnet-5-5", json!({"type": "between_tools"}), Value::Null, 500),
+        // Opus always thinks: low effort, and room for the thinking.
+        ("claude-opus-5-5", Value::Null, json!({"effort": "low"}), 5000),
+    ] {
+        m.queue.lock().unwrap().push(anthropic_ok("ok", "end_turn"));
+        let c = client(&m, "anthropic", model);
+        go(&c).unwrap();
+        let reqs = m.requests.lock().unwrap();
+        let body = &reqs.last().unwrap().1;
+        assert_eq!(body.get("thinking").cloned().unwrap_or(Value::Null), thinking, "{model}");
+        assert_eq!(body.get("output_config").cloned().unwrap_or(Value::Null), effort, "{model}");
+        assert_eq!(body["max_tokens"], max_tokens, "{model}");
+        assert!(body.get("temperature").is_none(), "{model}");
+        assert_eq!(c.max_output(500), max_tokens, "{model}");
+    }
+}
+
+/// A model that refuses our thinking setting gets the next one, and the
+/// client remembers what worked.
+#[test]
+fn claude_adapts_when_a_thinking_setting_is_refused() {
+    let m = mock();
+    let no = |msg: &str| (400, json!({"type": "error", "error": {"message": msg}}), vec![]);
+    m.queue.lock().unwrap().extend([
+        no("\"thinking.type.disabled\" is not supported for this model."),
+        no("thinking: Input tag 'between_tools' found using 'type' does not match any of the expected tags"),
+        anthropic_ok("fine", "end_turn"),
+        anthropic_ok("again", "end_turn"),
+    ]);
+    let c = client(&m, "anthropic", "claude-haiku-9");
+    assert_eq!(go(&c).unwrap().text, "fine");
+    assert_eq!(c.think(), llm::Think::LowEffort);
+    assert_eq!(go(&c).unwrap().text, "again");
+    let reqs = m.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 4); // the second call went straight to what works
+    assert_eq!(reqs[0].1["thinking"]["type"], "disabled");
+    assert_eq!(reqs[1].1["thinking"]["type"], "between_tools");
+    for r in &reqs[2..] {
+        assert!(r.1.get("thinking").is_none());
+        assert_eq!(r.1["output_config"]["effort"], "low");
+    }
+    drop(reqs);
+
+    // An older model without effort levels ends on a plain request.
+    m.queue
+        .lock()
+        .unwrap()
+        .extend([no("output_config.effort: Extra inputs are not permitted"), anthropic_ok("plain", "end_turn")]);
+    let c = client(&m, "anthropic", "claude-opus-3");
+    assert_eq!(go(&c).unwrap().text, "plain");
+    let reqs = m.requests.lock().unwrap();
+    let last = &reqs.last().unwrap().1;
+    assert!(last.get("thinking").is_none() && last.get("output_config").is_none());
+    drop(reqs);
+
+    // Anything else the API refuses is reported, not retried forever.
+    m.queue.lock().unwrap().push(no("messages: text content blocks must be non-empty"));
+    match go(&client(&m, "anthropic", "claude-haiku-5-5")) {
+        Err(LlmError::Fatal(msg)) => assert!(msg.contains("non-empty"), "{msg}"),
+        _ => panic!("expected fatal"),
+    }
+}
+
+#[test]
+fn claude_thinking_blocks_refusals_and_spent_limits() {
+    let m = mock();
+    let reply = |content: Value, stop: &str| {
+        (
+            200,
+            json!({"type": "message", "content": content, "stop_reason": stop, "usage": {"output_tokens": 500}}),
+            vec![],
+        )
+    };
+    m.queue.lock().unwrap().extend([
+        // Thinking comes first and has no text: the answer is the text block.
+        reply(
+            json!([{"type": "thinking", "thinking": "", "signature": "s"}, {"type": "text", "text": "answer"}]),
+            "end_turn",
+        ),
+        // The whole limit went on thinking.
+        reply(json!([{"type": "thinking", "thinking": "", "signature": "s"}]), "max_tokens"),
+        // The safety system declined.
+        reply(json!([]), "refusal"),
+    ]);
+    let c = client(&m, "anthropic", "claude-opus-5-5");
+    assert_eq!(go(&c).unwrap().text, "answer");
+    assert!(matches!(go(&c), Err(LlmError::NoRoom(u)) if u.output == 500));
+    assert!(matches!(go(&c), Err(LlmError::Refused(_))));
+    assert_eq!(m.requests.lock().unwrap().len(), 3); // none of these is retried blindly
+}
+
+#[test]
+fn openai_reasoning_and_filters() {
+    let m = mock();
+    let reply = |content: &str, finish: &str| {
+        (200, json!({"choices": [{"message": {"content": content}, "finish_reason": finish}], "usage": {}}), vec![])
+    };
+    m.queue.lock().unwrap().extend([reply("", "length"), reply("", "content_filter")]);
+    let c = client(&m, "openai", "some-reasoning-model");
+    assert!(matches!(go(&c), Err(LlmError::NoRoom(_))));
+    assert!(matches!(go(&c), Err(LlmError::Refused(_))));
+}
+
+#[test]
+fn models_are_listed_for_the_picker() {
+    let m = mock();
+    m.queue.lock().unwrap().extend([
+        (200, json!({"data": [{"id": "gemma-4-26b"}, {"id": "text-embedding-nomic"}]}), vec![]),
+        (200, json!({"data": [{"id": "claude-haiku-5-5", "type": "model"}]}), vec![]),
+        (401, json!({"error": {"message": "nope"}}), vec![]),
+    ]);
+    let local = llm::list_models("local", "", Some(&format!("{}/v1", m.url))).unwrap();
+    assert_eq!(local, ["gemma-4-26b", "text-embedding-nomic"]);
+    let claude = llm::list_models("anthropic", "key-123", Some(&format!("{}/v1/messages", m.url))).unwrap();
+    assert_eq!(claude, ["claude-haiku-5-5"]);
+    assert!(llm::list_models("openai", "bad", Some(&format!("{}/v1", m.url))).unwrap_err().contains("rejected"));
+    let reqs = m.requests.lock().unwrap();
+    assert!(header(&reqs[0].0, "authorization").is_none()); // no key for a local server
+    assert_eq!(header(&reqs[1].0, "x-api-key"), Some("key-123"));
+    drop(reqs);
+    assert!(llm::list_models("local", "", Some("http://127.0.0.1:9/v1")).unwrap_err().contains("LM Studio"));
 }
