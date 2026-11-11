@@ -51,6 +51,18 @@ pub struct Unit {
     standalone: bool,
 }
 
+/// Script dialect differences.
+#[derive(Clone, Debug, Default)]
+pub struct Dialect {
+    /// TyranoScript: `#name` / `#name:face` lines set the speaker, `#` clears it.
+    pub hash_names: bool,
+    /// Speaker names that are also character ids (TyranoScript `[chara_new
+    /// name=...]`): rewriting those would break sprites, so they're context only.
+    pub fixed_names: std::collections::HashSet<String>,
+}
+
+static HASH_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^#([^\s:\[\]]*)(:\S*)?$").unwrap());
+
 /// Returns (text, encoding label). Kirikiri accepts UTF-16LE with BOM, UTF-8
 /// with BOM, or Shift-JIS.
 pub fn decode(data: &[u8]) -> (String, &'static str) {
@@ -150,6 +162,11 @@ fn clean(line: &str) -> &str {
 
 /// Split a .ks file into translation units.
 pub fn parse(text: &str) -> Vec<Unit> {
+    parse_with(text, &Dialect::default())
+}
+
+/// [`parse`] for a script dialect.
+pub fn parse_with(text: &str, d: &Dialect) -> Vec<Unit> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut units: Vec<Unit> = Vec::new();
     let mut cur: Option<Unit> = None;
@@ -178,6 +195,21 @@ pub fn parse(text: &str) -> Vec<Unit> {
             close(&mut cur, &mut units);
             in_script = true;
             continue;
+        }
+        if d.hash_names && s.starts_with('#') {
+            if let Some(c) = HASH_NAME_RE.captures(s) {
+                close(&mut cur, &mut units);
+                let name = c[1].to_string();
+                let face = c.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+                pending = if name.is_empty() {
+                    None
+                } else if JP_RE.is_match(&name) && !d.fixed_names.contains(&name) {
+                    Some((Some(i), name, Some(("#".into(), face))))
+                } else {
+                    Some((None, name, None))
+                };
+                continue;
+            }
         }
         if !is_text_line(s) {
             close(&mut cur, &mut units);
@@ -215,7 +247,12 @@ pub fn parse(text: &str) -> Vec<Unit> {
 
 /// msg-tool/VNTextPatch-style entries for a .ks file.
 pub fn export_entries(text: &str) -> Vec<Entry> {
-    parse(text)
+    export_entries_with(text, &Dialect::default())
+}
+
+/// [`export_entries`] for a script dialect.
+pub fn export_entries_with(text: &str, d: &Dialect) -> Vec<Entry> {
+    parse_with(text, d)
         .into_iter()
         .map(|u| {
             let mut name = u.name.clone();
@@ -233,8 +270,13 @@ pub fn export_entries(text: &str) -> Vec<Entry> {
 
 /// Write translated entries back. Entry order must match `export_entries`.
 pub fn apply_entries(text: &str, entries: &[Entry]) -> crate::Result<String> {
+    apply_entries_with(text, entries, &Dialect::default())
+}
+
+/// [`apply_entries`] for a script dialect.
+pub fn apply_entries_with(text: &str, entries: &[Entry], d: &Dialect) -> crate::Result<String> {
     let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
-    let units = parse(text);
+    let units = parse_with(text, d);
     if units.len() != entries.len() {
         return crate::error::user(format!(
             "The script changed since it was read ({} vs {} text blocks). Read the scripts again.",

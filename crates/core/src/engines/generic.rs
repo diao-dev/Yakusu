@@ -118,16 +118,6 @@ pub const PROFILES: &[Profile] = &[
 /// Engines we recognise but can't patch automatically, with what to do instead.
 const KNOWN_UNSUPPORTED: &[(&[&str], &str, &str)] = &[
     (
-        &["UnityPlayer.dll", "GameAssembly.dll"],
-        "Unity",
-        "This is a Unity game. Unity keeps its text inside compiled game data in a different way for every game, so Yakusu can't read or patch it.",
-    ),
-    (
-        &["www/data", "data/System.json", "Game.rgss3a", "Game.rgss2a", "Game.rgssad", "Game.rpgproject"],
-        "RPG Maker",
-        "This is an RPG Maker game. Yakusu translates visual novel engines and can't read RPG Maker data.",
-    ),
-    (
         &["Scene.pck", "Gameexe.dat"],
         "SiglusEngine",
         "SiglusEngine isn't supported yet. No open tool can rebuild its Scene.pck reliably.",

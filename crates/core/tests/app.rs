@@ -320,7 +320,7 @@ fn a_file_or_a_wrong_folder_is_handled_plainly() {
     let st = call(&a, "state", json!({}));
     assert!(st["folder_note"].as_str().unwrap().contains("no game .exe"), "{}", st["folder_note"]);
 
-    // Unity is named, with the reason.
+    // Unity is recognised (experimental: it reads Naninovel text).
     let unity = tmp.path().join("unity");
     std::fs::create_dir_all(unity.join("game_Data")).unwrap();
     std::fs::write(unity.join("UnityPlayer.dll"), b"x").unwrap();

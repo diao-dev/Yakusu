@@ -11,12 +11,20 @@
 //!   install(cx)       -> copy the staged files into the game folder, backing
 //!                        up anything they replace; restore() undoes it.
 
+pub mod asar;
 pub mod generic;
 pub mod kirikiri;
 pub mod ks;
+pub mod lcf;
+pub mod livemaker;
 pub mod manual;
 pub mod msgtool;
+pub mod rgss;
+pub mod rpgmaker;
+pub mod tyrano;
+pub mod unity;
 pub mod xp3;
+pub mod zipped;
 
 use crate::config::{write_json_atomic, Env};
 use crate::error::{user, Error, Result};
@@ -147,6 +155,24 @@ pub fn detect(game_dir: &Path) -> Result<Vec<Match>> {
     if let Some(m) = kirikiri::detect(game_dir) {
         matches.push(m);
     }
+    if let Some(m) = livemaker::detect(game_dir) {
+        matches.push(m);
+    }
+    if let Some(m) = tyrano::detect(game_dir) {
+        matches.push(m);
+    }
+    if let Some(m) = rpgmaker::detect(game_dir) {
+        matches.push(m);
+    }
+    if let Some(m) = rgss::detect(game_dir) {
+        matches.push(m);
+    }
+    if let Some(m) = lcf::detect(game_dir) {
+        matches.push(m);
+    }
+    if let Some(m) = unity::detect(game_dir) {
+        matches.push(m);
+    }
     for prof in generic::PROFILES {
         if let Some(m) = generic::detect_profile(game_dir, prof) {
             matches.push(m);
@@ -170,6 +196,12 @@ pub fn detect(game_dir: &Path) -> Result<Vec<Match>> {
 pub fn engine_for(m: &Match) -> Result<Box<dyn Engine>> {
     match m.engine_id.as_str() {
         "kirikiri" => Ok(Box::new(kirikiri::Kirikiri { m: m.clone() })),
+        "livemaker" => Ok(Box::new(livemaker::LiveMaker { m: m.clone() })),
+        "tyrano" => Ok(Box::new(tyrano::Tyrano { m: m.clone() })),
+        "rpgmaker" => Ok(Box::new(rpgmaker::RpgMaker { m: m.clone() })),
+        "rgss" => Ok(Box::new(rgss::Rgss { m: m.clone() })),
+        "lcf" => Ok(Box::new(lcf::Lcf { m: m.clone() })),
+        "unity" => Ok(Box::new(unity::Unity { m: m.clone() })),
         "scripts" => Ok(Box::new(manual::ScriptFolder { m: m.clone() })),
         id if generic::profile(id).is_some() => Ok(Box::new(generic::MsgToolEngine { m: m.clone() })),
         _ => Err(Error::User(format!("{} isn't supported. {}", m.name, m.note).trim().to_string())),

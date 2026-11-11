@@ -604,6 +604,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crc32fast"
 version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2131,6 +2146,22 @@ name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+
+[[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
+]
 
 [[package]]
 name = "markup5ever"
@@ -5241,7 +5272,7 @@ dependencies = [
 
 [[package]]
 name = "yakusu"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde_json",
  "sha1_smol",
@@ -5255,7 +5286,7 @@ dependencies = [
 
 [[package]]
 name = "yakusu-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "csv",
@@ -5263,11 +5294,14 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "indexmap 2.14.2",
+ "lz4_flex",
+ "lzma-rs",
  "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha1_smol",
+ "sha2",
  "strsim",
  "tempfile",
  "tiny_http",
