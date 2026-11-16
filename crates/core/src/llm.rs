@@ -175,7 +175,60 @@ pub trait Llm: Send + Sync {
         requested
     }
     fn complete(&self, system: &str, user: &str, max_tokens: u32, cancel: &AtomicBool) -> Result<Completion, LlmError>;
+
+    /// Whether requests can go through the provider's Batch API (half price,
+    /// answered within 24 hours instead of right away).
+    fn batch_supported(&self) -> bool {
+        false
+    }
+    /// Most bytes of requests one batch job may carry.
+    fn batch_max_bytes(&self) -> usize {
+        0
+    }
+    /// Send a batch job; returns its id.
+    fn batch_submit(&self, _reqs: &[BatchRequest], _cancel: &AtomicBool) -> Result<String, LlmError> {
+        Err(LlmError::Fatal(NO_BATCH.into()))
+    }
+    fn batch_status(&self, _id: &str, _cancel: &AtomicBool) -> Result<BatchStatus, LlmError> {
+        Err(LlmError::Fatal(NO_BATCH.into()))
+    }
+    /// The answers of a finished job, by request key. `keys` are the keys sent,
+    /// in order (for providers that don't echo them back).
+    fn batch_results(
+        &self,
+        _id: &str,
+        _keys: &[String],
+        _cancel: &AtomicBool,
+    ) -> Result<Vec<(String, BatchAnswer)>, LlmError> {
+        Err(LlmError::Fatal(NO_BATCH.into()))
+    }
 }
+
+const NO_BATCH: &str = "This provider has no Batch API.";
+
+/// One request in a Batch API job.
+#[derive(Clone, Debug)]
+pub struct BatchRequest {
+    /// Up to 64 of `[A-Za-z0-9_-]` (Anthropic's rule for custom ids).
+    pub key: String,
+    pub system: String,
+    pub user: String,
+    pub max_tokens: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BatchStatus {
+    /// Nothing more will happen to the job.
+    pub done: bool,
+    /// Requests finished so far, when the provider says.
+    pub finished: usize,
+    /// The whole job ended without answers (expired, cancelled, failed).
+    pub failed: Option<String>,
+}
+
+/// One request's answer from a batch: like a live call's, `Fatal` when that
+/// request errored or expired.
+pub type BatchAnswer = Result<(String, Usage), LlmError>;
 
 /// Builds a client for (provider, key, model, base_url).
 pub type ClientFactory = Arc<dyn Fn(&str, &str, &str, Option<&str>) -> Arc<dyn Llm> + Send + Sync>;
@@ -302,7 +355,18 @@ impl Client {
     }
 
     fn post(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value, Attempt> {
-        let mut req = self.http.post(url).json(body);
+        let text = self.send(self.http.post(url).json(body), headers)?;
+        serde_json::from_str(&text).map_err(|_| Attempt::Transient("The API sent an unreadable reply.".into(), None))
+    }
+
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<String, Attempt> {
+        self.send(self.http.get(url), headers)
+    }
+
+    /// Send a request; the body of a 2xx reply, or the failure sorted by what
+    /// to do about it.
+    fn send(&self, req: reqwest::blocking::RequestBuilder, headers: &[(&str, &str)]) -> Result<String, Attempt> {
+        let mut req = req;
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
@@ -326,8 +390,7 @@ impl Client {
             resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<f64>().ok());
         let text = resp.text().unwrap_or_default();
         if (200..300).contains(&status) {
-            return serde_json::from_str(&text)
-                .map_err(|_| Attempt::Transient("The API sent an unreadable reply.".into(), None));
+            return Ok(text);
         }
         let detail = serde_json::from_str::<Value>(&text)
             .ok()
@@ -365,26 +428,36 @@ impl Client {
         }
     }
 
+    fn anthropic_headers(&self) -> [(&str, &str); 2] {
+        [("x-api-key", self.api_key.as_str()), ("anthropic-version", ANTHROPIC_VERSION)]
+    }
+
+    /// The Messages API request body (shared by live calls and batches).
+    fn anthropic_body(&self, system: &str, user: &str, max_tokens: u32, think: Think) -> Value {
+        // No sampling parameters: current Claude models reject `temperature`.
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": if think.thinks() { with_thinking_room(max_tokens) } else { max_tokens },
+            // Instructions + style sheet + glossary are the same for every batch: cached.
+            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": user}],
+        });
+        match think {
+            Think::Disabled => body["thinking"] = json!({"type": "disabled"}),
+            Think::BetweenTools => body["thinking"] = json!({"type": "between_tools"}),
+            Think::LowEffort => body["output_config"] = json!({"effort": "low"}),
+            Think::Default => {}
+        }
+        body
+    }
+
     fn anthropic(&self, system: &str, user: &str, max_tokens: u32) -> Result<(String, Usage), Attempt> {
-        let headers = [("x-api-key", self.api_key.as_str()), ("anthropic-version", ANTHROPIC_VERSION)];
+        let headers = self.anthropic_headers();
         let mut data = None;
         // At most one request per thinking setting.
         for _ in 0..4 {
             let think = self.think();
-            // No sampling parameters: current Claude models reject `temperature`.
-            let mut body = json!({
-                "model": self.model,
-                "max_tokens": if think.thinks() { with_thinking_room(max_tokens) } else { max_tokens },
-                // Instructions + style sheet + glossary are the same for every batch: cached.
-                "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                "messages": [{"role": "user", "content": user}],
-            });
-            match think {
-                Think::Disabled => body["thinking"] = json!({"type": "disabled"}),
-                Think::BetweenTools => body["thinking"] = json!({"type": "between_tools"}),
-                Think::LowEffort => body["output_config"] = json!({"effort": "low"}),
-                Think::Default => {}
-            }
+            let body = self.anthropic_body(system, user, max_tokens, think);
             match self.post(&self.base_url, &headers, &body) {
                 Ok(d) => {
                     data = Some(d);
@@ -413,34 +486,7 @@ impl Client {
         if data.get("type").and_then(Value::as_str) == Some("error") {
             return Err(Attempt::Transient(data.get("error").map(|e| e.to_string()).unwrap_or_default(), None));
         }
-        // Pick text blocks by type: a reply can start with thinking blocks.
-        let text: String = data
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let u = data.get("usage").cloned().unwrap_or(Value::Null);
-        let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let usage = Usage {
-            input: n("input_tokens"),
-            output: n("output_tokens"),
-            cache_write: n("cache_creation_input_tokens"),
-            cache_read: n("cache_read_input_tokens"),
-        };
-        match data.get("stop_reason").and_then(Value::as_str) {
-            Some("refusal") => Err(Attempt::Refused(usage)),
-            Some("max_tokens" | "model_context_window_exceeded") if text.trim().is_empty() => {
-                Err(Attempt::NoRoom(usage))
-            }
-            Some("max_tokens" | "model_context_window_exceeded") => Err(Attempt::Truncated(usage)),
-            _ => Ok((text, usage)),
-        }
+        anthropic_read(&data)
     }
 
     fn openai(&self, system: &str, user: &str, max_tokens: u32) -> Result<(String, Usage), Attempt> {
@@ -506,6 +552,72 @@ impl Client {
     }
 }
 
+/// Text and usage from a Messages API reply (live or from a batch).
+fn anthropic_read(data: &Value) -> Result<(String, Usage), Attempt> {
+    // Pick text blocks by type: a reply can start with thinking blocks.
+    let text: String = data
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let u = data.get("usage").cloned().unwrap_or(Value::Null);
+    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let usage = Usage {
+        input: n("input_tokens"),
+        output: n("output_tokens"),
+        cache_write: n("cache_creation_input_tokens"),
+        cache_read: n("cache_read_input_tokens"),
+    };
+    match data.get("stop_reason").and_then(Value::as_str) {
+        Some("refusal") => Err(Attempt::Refused(usage)),
+        Some("max_tokens" | "model_context_window_exceeded") if text.trim().is_empty() => Err(Attempt::NoRoom(usage)),
+        Some("max_tokens" | "model_context_window_exceeded") => Err(Attempt::Truncated(usage)),
+        _ => Ok((text, usage)),
+    }
+}
+
+/// Text and usage from a Gemini `generateContent` reply (native API, as a
+/// batch returns it). Thought parts are skipped; thinking is billed as output.
+fn gemini_read(data: &Value) -> Result<(String, Usage), Attempt> {
+    let u = data.get("usageMetadata").cloned().unwrap_or(Value::Null);
+    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let usage = Usage {
+        input: n("promptTokenCount"),
+        output: n("candidatesTokenCount") + n("thoughtsTokenCount"),
+        cache_write: 0,
+        cache_read: 0,
+    };
+    if data.pointer("/promptFeedback/blockReason").is_some() {
+        return Err(Attempt::Refused(usage));
+    }
+    let Some(cand) = data.pointer("/candidates/0") else {
+        return Err(Attempt::Transient("The reply had no answer in it.".into(), None));
+    };
+    let text: String = cand
+        .pointer("/content/parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| !p.get("thought").and_then(Value::as_bool).unwrap_or(false))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    match cand.get("finishReason").and_then(Value::as_str) {
+        Some("SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" | "RECITATION") => Err(Attempt::Refused(usage)),
+        Some("MAX_TOKENS") if text.trim().is_empty() => Err(Attempt::NoRoom(usage)),
+        Some("MAX_TOKENS") => Err(Attempt::Truncated(usage)),
+        _ => Ok((text, usage)),
+    }
+}
+
 impl Llm for Client {
     fn model(&self) -> &str {
         &self.model
@@ -521,20 +633,162 @@ impl Llm for Client {
     }
 
     fn complete(&self, system: &str, user: &str, max_tokens: u32, cancel: &AtomicBool) -> Result<Completion, LlmError> {
-        let mut delay = 2.0f64;
-        let mut last = String::new();
-        for _ in 0..self.max_attempts {
-            let r = if self.kind == "anthropic" {
+        let (text, usage) = self.retrying(cancel, || {
+            if self.kind == "anthropic" {
                 self.anthropic(system, user, max_tokens)
             } else {
                 self.openai(system, user, max_tokens)
-            };
-            match r {
-                Ok((text, usage)) => return Ok(Completion { usd: cost_usd(&self.model, &usage), text, usage }),
-                Err(Attempt::Truncated(u)) => return Err(LlmError::Truncated(u)),
-                Err(Attempt::NoRoom(u)) => return Err(LlmError::NoRoom(u)),
-                Err(Attempt::Refused(u)) => return Err(LlmError::Refused(u)),
-                Err(Attempt::Fatal(m)) | Err(Attempt::BadRequest(m)) => return Err(LlmError::Fatal(m)),
+            }
+        })?;
+        Ok(Completion { usd: cost_usd(&self.model, &usage), text, usage })
+    }
+
+    fn batch_supported(&self) -> bool {
+        self.kind == "anthropic" || self.gemini_native().is_some()
+    }
+
+    fn batch_max_bytes(&self) -> usize {
+        // Anthropic takes up to 256 MB per batch; Gemini up to 20 MB inline.
+        if self.kind == "anthropic" {
+            100 << 20
+        } else {
+            15 << 20
+        }
+    }
+
+    fn batch_submit(&self, reqs: &[BatchRequest], cancel: &AtomicBool) -> Result<String, LlmError> {
+        if self.kind == "anthropic" {
+            let think = self.think();
+            let requests: Vec<Value> = reqs
+                .iter()
+                .map(|r| {
+                    json!({"custom_id": r.key,
+                           "params": self.anthropic_body(&r.system, &r.user, r.max_tokens, think)})
+                })
+                .collect();
+            let body = json!({ "requests": requests });
+            let url = format!("{}/batches", self.base_url);
+            let data = self.retrying(cancel, || self.post(&url, &self.anthropic_headers(), &body))?;
+            return data
+                .get("id")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .ok_or_else(|| LlmError::Fatal(format!("The batch wasn't accepted: {}", short(&data.to_string()))));
+        }
+        let base = self.gemini_native().ok_or_else(|| LlmError::Fatal(NO_BATCH.into()))?;
+        let requests: Vec<Value> = reqs
+            .iter()
+            .map(|r| {
+                json!({"request": self.gemini_body(&r.system, &r.user, r.max_tokens),
+                       "metadata": {"key": r.key}})
+            })
+            .collect();
+        let body = json!({"batch": {"display_name": "yakusu",
+                                    "input_config": {"requests": {"requests": requests}}}});
+        let url = format!("{base}/models/{}:batchGenerateContent", self.model);
+        let key = self.api_key.clone();
+        let data = self.retrying(cancel, || self.post(&url, &[("x-goog-api-key", key.as_str())], &body))?;
+        data.get("name")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| LlmError::Fatal(format!("The batch wasn't accepted: {}", short(&data.to_string()))))
+    }
+
+    fn batch_status(&self, id: &str, cancel: &AtomicBool) -> Result<BatchStatus, LlmError> {
+        let data = self.batch_get(id, cancel)?;
+        if self.kind == "anthropic" {
+            let c = |k: &str| data.pointer(&format!("/request_counts/{k}")).and_then(Value::as_u64).unwrap_or(0);
+            let finished = c("succeeded") + c("errored") + c("canceled") + c("expired");
+            let done = data.get("processing_status").and_then(Value::as_str) == Some("ended");
+            return Ok(BatchStatus { done, finished: finished as usize, failed: None });
+        }
+        let state = data
+            .pointer("/metadata/state")
+            .or_else(|| data.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let stats = data.pointer("/metadata/batchStats").or_else(|| data.get("batchStats"));
+        let num = |k: &str| {
+            stats
+                .and_then(|s| s.get(k))
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0)
+        };
+        let finished = (num("successfulRequestCount") + num("failedRequestCount")) as usize;
+        let ended = ["SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"].iter().any(|e| state.ends_with(e));
+        let done = ended || data.get("done").and_then(Value::as_bool).unwrap_or(false);
+        let failed = (done && !state.ends_with("SUCCEEDED") && !state.is_empty())
+            .then(|| format!("Gemini ended the batch ({}).", state.to_lowercase().replace('_', " ")));
+        Ok(BatchStatus { done, finished, failed })
+    }
+
+    fn batch_results(
+        &self,
+        id: &str,
+        keys: &[String],
+        cancel: &AtomicBool,
+    ) -> Result<Vec<(String, BatchAnswer)>, LlmError> {
+        let data = self.batch_get(id, cancel)?;
+        if self.kind == "anthropic" {
+            let url = data
+                .get("results_url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LlmError::Fatal("The batch has no results to download yet.".into()))?;
+            let text = self.retrying(cancel, || self.get(url, &self.anthropic_headers()))?;
+            let mut out = Vec::new();
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                let Some(key) = v.get("custom_id").and_then(Value::as_str) else { continue };
+                let r = &v["result"];
+                let ans = match r.get("type").and_then(Value::as_str) {
+                    Some("succeeded") => anthropic_read(&r["message"]).map_err(attempt_error),
+                    Some("errored") => Err(LlmError::Fatal(
+                        r.pointer("/error/error/message")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                            .unwrap_or_else(|| short(&r.to_string())),
+                    )),
+                    other => Err(LlmError::Fatal(format!("The request was {}.", other.unwrap_or("lost")))),
+                };
+                out.push((key.to_string(), ans));
+            }
+            return Ok(out);
+        }
+        let items = find_inlined(&data).ok_or_else(|| LlmError::Fatal("The batch has no answers in it.".into()))?;
+        Ok(items
+            .iter()
+            .enumerate()
+            .filter_map(|(k, it)| {
+                let key = it
+                    .pointer("/metadata/key")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| keys.get(k).cloned())?;
+                let ans = match (it.get("response"), it.get("error")) {
+                    (Some(r), _) => gemini_read(r).map_err(attempt_error),
+                    (None, Some(e)) => Err(LlmError::Fatal(
+                        e.get("message")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                            .unwrap_or_else(|| short(&e.to_string())),
+                    )),
+                    _ => Err(LlmError::Fatal("No answer for this request.".into())),
+                };
+                Some((key, ans))
+            })
+            .collect())
+    }
+}
+
+impl Client {
+    /// Run `f` until it succeeds or fails for good, backing off on transient errors.
+    fn retrying<T>(&self, cancel: &AtomicBool, f: impl Fn() -> Result<T, Attempt>) -> Result<T, LlmError> {
+        let mut delay = 2.0f64;
+        let mut last = String::new();
+        for _ in 0..self.max_attempts {
+            match f() {
+                Ok(v) => return Ok(v),
                 Err(Attempt::Transient(m, retry_after)) => {
                     last = m;
                     let wait = retry_after.unwrap_or(delay).clamp(0.5, 120.0);
@@ -544,9 +798,81 @@ impl Llm for Client {
                     }
                     delay = (delay * 2.0).min(60.0);
                 }
+                Err(e) => return Err(attempt_error(e)),
             }
         }
         Err(LlmError::Fatal(format!("Gave up after {} tries: {last}", self.max_attempts)))
+    }
+
+    /// Gemini's native API root, when this client talks to Gemini through
+    /// its OpenAI-compatible address (batches only exist natively).
+    fn gemini_native(&self) -> Option<String> {
+        (self.provider == "gemini").then(|| self.base_url.strip_suffix("/openai").map(String::from)).flatten()
+    }
+
+    /// A Gemini `generateContent` request with the same settings live calls use.
+    fn gemini_body(&self, system: &str, user: &str, max_tokens: u32) -> Value {
+        let mut cfg = json!({"maxOutputTokens": self.max_output(max_tokens)});
+        let oa = self.oa.lock().unwrap();
+        if oa.temperature {
+            cfg["temperature"] = json!(0.3);
+        }
+        if oa.effort.is_some() {
+            // Gemini 2.x takes a thinking budget; newer models a thinking level.
+            cfg["thinkingConfig"] = if self.model.contains("gemini-2") {
+                json!({"thinkingBudget": 1024})
+            } else {
+                json!({"thinkingLevel": "low"})
+            };
+        }
+        json!({
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": cfg,
+        })
+    }
+
+    fn batch_get(&self, id: &str, cancel: &AtomicBool) -> Result<Value, LlmError> {
+        let (url, headers): (String, Vec<(&str, &str)>) = if self.kind == "anthropic" {
+            (format!("{}/batches/{id}", self.base_url), self.anthropic_headers().to_vec())
+        } else {
+            let base = self.gemini_native().ok_or_else(|| LlmError::Fatal(NO_BATCH.into()))?;
+            (format!("{base}/{id}"), vec![("x-goog-api-key", self.api_key.as_str())])
+        };
+        let text = self.retrying(cancel, || self.get(&url, &headers))?;
+        serde_json::from_str(&text).map_err(|_| LlmError::Fatal("The API sent an unreadable batch status.".into()))
+    }
+}
+
+fn attempt_error(a: Attempt) -> LlmError {
+    match a {
+        Attempt::Truncated(u) => LlmError::Truncated(u),
+        Attempt::NoRoom(u) => LlmError::NoRoom(u),
+        Attempt::Refused(u) => LlmError::Refused(u),
+        Attempt::Fatal(m) | Attempt::BadRequest(m) | Attempt::Transient(m, _) => LlmError::Fatal(m),
+    }
+}
+
+fn short(s: &str) -> String {
+    s.chars().take(300).collect()
+}
+
+/// The list of answers in a finished Gemini batch. Google's docs show it
+/// under `response` and under `dest`, as `inlinedResponses` (sometimes
+/// wrapped in an object of the same name).
+fn find_inlined(v: &Value) -> Option<&Vec<Value>> {
+    match v {
+        Value::Object(m) => {
+            if let Some(x) = m.get("inlinedResponses") {
+                return match x {
+                    Value::Array(a) => Some(a),
+                    other => find_inlined(other),
+                };
+            }
+            m.values().find_map(find_inlined)
+        }
+        Value::Array(a) => a.iter().find_map(find_inlined),
+        _ => None,
     }
 }
 
@@ -627,6 +953,7 @@ pub mod fake {
     //! without a network or an API key.
 
     use super::*;
+    use std::collections::HashMap;
 
     static PH: LazyLock<Regex> = LazyLock::new(|| Regex::new("⟦\\d+⟧").unwrap());
 
@@ -727,16 +1054,68 @@ pub mod fake {
             if !self.delay.is_zero() {
                 std::thread::sleep(self.delay);
             }
+            let (text, usage) = self.answer(system, user)?;
+            Ok(Completion { usd: cost_usd(&self.model, &usage), text, usage })
+        }
+
+        fn batch_supported(&self) -> bool {
+            true
+        }
+        fn batch_max_bytes(&self) -> usize {
+            1 << 20
+        }
+        fn batch_submit(&self, reqs: &[BatchRequest], _cancel: &AtomicBool) -> Result<String, LlmError> {
+            let id = format!("fakebatch_{}", FAKE_JOB_N.fetch_add(1, Ordering::SeqCst));
+            self.calls.lock().unwrap().push(("[submit]".into(), id.clone()));
+            // A model named "...slow..." keeps its batches waiting (tests set them free).
+            let checks = if self.model.contains("slow") { usize::MAX } else { 1 };
+            FAKE_JOBS.lock().unwrap().insert(id.clone(), (reqs.to_vec(), checks));
+            Ok(id)
+        }
+        fn batch_status(&self, id: &str, _cancel: &AtomicBool) -> Result<BatchStatus, LlmError> {
+            let mut jobs = FAKE_JOBS.lock().unwrap();
+            let (reqs, left) = jobs.get_mut(id).ok_or_else(|| LlmError::Fatal("no such batch".into()))?;
+            if *left > 0 {
+                *left -= 1;
+                return Ok(BatchStatus { done: false, finished: 0, failed: None });
+            }
+            Ok(BatchStatus { done: true, finished: reqs.len(), failed: None })
+        }
+        fn batch_results(
+            &self,
+            id: &str,
+            _keys: &[String],
+            _cancel: &AtomicBool,
+        ) -> Result<Vec<(String, BatchAnswer)>, LlmError> {
+            let reqs = FAKE_JOBS.lock().unwrap().get(id).map(|j| j.0.clone()).unwrap_or_default();
+            Ok(reqs
+                .iter()
+                .map(|r| {
+                    self.calls.lock().unwrap().push((
+                        format!("[batch] {}", r.system.chars().take(32).collect::<String>()),
+                        r.user.chars().take(60).collect(),
+                    ));
+                    (r.key.clone(), self.answer(&r.system, &r.user))
+                })
+                .collect())
+        }
+    }
+
+    /// Batch jobs sent to fake models: id -> (requests, status checks left
+    /// before it's done). Shared by every fake client, like a real provider.
+    pub static FAKE_JOBS: LazyLock<Mutex<HashMap<String, (Vec<BatchRequest>, usize)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static FAKE_JOB_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    impl FakeLlm {
+        fn answer(&self, system: &str, user: &str) -> Result<(String, Usage), LlmError> {
+            let usage = Usage { input: user.len() as u64 / 2, output: 200, ..Default::default() };
             if let Some(h) = &self.hook {
                 if let Some(r) = h(system, user) {
-                    return r.map(|text| {
-                        let usage = Usage { input: user.len() as u64 / 2, output: 200, ..Default::default() };
-                        Completion { usd: cost_usd(&self.model, &usage), text, usage }
-                    });
+                    return r.map(|text| (text, usage));
                 }
             }
-            let usage = Usage { input: user.len() as u64 / 2, output: 200, ..Default::default() };
-            Ok(Completion { text: reply(system, user), usd: cost_usd(&self.model, &usage), usage })
+            Ok((reply(system, user), usage))
         }
     }
 

@@ -640,6 +640,9 @@ impl App {
         if let Some(v) = a.get("review").and_then(Value::as_bool) {
             s.review = v;
         }
+        if let Some(v) = a.get("batch_api").and_then(Value::as_bool) {
+            s.batch_api = v;
+        }
         let num =
             |k: &str| a.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
         if let Some(v) = num("budget_usd") {
