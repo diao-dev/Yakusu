@@ -23,7 +23,8 @@ fn ruby_check(data: &[u8]) -> Option<String> {
     std::fs::write(&p, data).ok()?;
     let out = std::process::Command::new("ruby").arg(fixture("check.rb")).arg(&p).output().ok()?;
     assert!(out.status.success(), "Ruby couldn't load it: {}", String::from_utf8_lossy(&out.stderr));
-    Some(String::from_utf8(out.stdout).unwrap())
+    // Ruby on Windows ends lines with \r\n.
+    Some(String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n"))
 }
 
 #[test]
