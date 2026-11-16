@@ -144,6 +144,8 @@
           <label class="fit-field"><span>Earlier lines shown for context <b id="ctxVal"></b></span><input type="range" id="contextLines" min="0" max="30" step="1"></label>
         </div>
         <p class="hint">Bigger requests are a little cheaper. More at once is faster but can hit your provider's rate limit.</p>
+        <label class="check"><input type="checkbox" id="batchApi"> Use the Batch API (half price, slower)</label>
+        <p class="hint">Claude and Gemini only. The whole translation, then the review, goes out as one job and costs half as much. Answers usually take minutes to an hour, at most 24 hours. You can close Yakusu while it waits; it collects them next time. The 150-line test and single-line retranslations still run right away.</p>
       </div>
       <p class="hint" id="versionLine"></p>
     </section>

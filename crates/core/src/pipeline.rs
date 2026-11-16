@@ -19,6 +19,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
+
+mod batch;
+use batch::Prefetched;
 
 /// Strings that are clearly not dialogue: file names, identifiers, paths.
 static NOT_TEXT_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -178,6 +182,17 @@ fn en_of(v: &Value) -> String {
     }
 }
 
+/// A short, stable id for a model request (also the Batch API's custom id).
+fn request_key(stage: &str, model: &str, system: &str, body: &str, max_tokens: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [stage, model, system, body, &max_tokens.to_string()] {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    h.finalize().iter().take(20).map(|b| format!("{b:02x}")).collect()
+}
+
 fn jsonl<T: Serialize>(items: &[T]) -> String {
     items.iter().map(|it| serde_json::to_string(it).unwrap()).collect::<Vec<_>>().join("\n")
 }
@@ -236,6 +251,11 @@ pub struct Pipeline {
     reserved: Mutex<f64>,
     /// Requests the model's safety system declined during this run.
     refused: AtomicUsize,
+    /// Answers that came back through the Batch API, by request key (see
+    /// `batch.rs`). A model call takes its answer from here instead of asking.
+    prefetched: Mutex<HashMap<String, Prefetched>>,
+    /// How long to wait between checks on a batch job.
+    pub batch_poll: Duration,
 }
 
 impl Pipeline {
@@ -250,6 +270,8 @@ impl Pipeline {
             factory,
             reserved: Mutex::new(0.0),
             refused: AtomicUsize::new(0),
+            prefetched: Mutex::new(HashMap::new()),
+            batch_poll: Duration::from_secs(30),
         }
     }
 
@@ -471,11 +493,10 @@ impl Pipeline {
     /// Reserve the most a call could cost before making it, so parallel
     /// calls together can't push spending past the limit. Returns the amount
     /// reserved; release it with [`Pipeline::release`] once the call is done.
-    fn reserve(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> Result<f64> {
+    /// The most a call could cost: ~2 bytes per input token, every output
+    /// token used. An error when the price isn't known and there's a limit.
+    fn worst_cost(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> Result<f64> {
         let cap = self.s.budget_usd;
-        if cap <= 0.0 {
-            return Ok(0.0);
-        }
         let Some(p) = self.price(model) else {
             return Err(Error::Budget(format!(
                 "Yakusu doesn't know what {model} costs, so it can't keep this run under your ${cap:.2} spending \
@@ -483,9 +504,16 @@ impl Pipeline {
                  to run without one."
             )));
         };
-        // Generous upper bound: ~2 bytes per input token, every output token used.
         let input_tokens = (system.len() + user_msg.len()) as f64 / 2.0;
-        let worst = (input_tokens * p[0].max(p[2]) + max_tokens as f64 * p[1]) / 1e6;
+        Ok((input_tokens * p[0].max(p[2]) + max_tokens as f64 * p[1]) / 1e6)
+    }
+
+    fn reserve(&self, model: &str, system: &str, user_msg: &str, max_tokens: u32) -> Result<f64> {
+        let cap = self.s.budget_usd;
+        if cap <= 0.0 {
+            return Ok(0.0);
+        }
+        let worst = self.worst_cost(model, system, user_msg, max_tokens)?;
         let mut reserved = self.reserved.lock().unwrap();
         let spent = self.p.spent_total();
         if spent + *reserved + worst > cap {
@@ -506,12 +534,41 @@ impl Pipeline {
     }
 
     fn call(&self, client: &dyn Llm, stage: &str, system: &str, user_msg: &str, max_tokens: u32) -> Result<String> {
+        self.call_keyed(client, stage, system, user_msg, user_msg, max_tokens)
+    }
+
+    /// A model call. `key_body` is the part of `user_msg` that identifies the
+    /// request (without context that can change between runs): a Batch API
+    /// answer for the same request is used instead of asking again.
+    fn call_keyed(
+        &self,
+        client: &dyn Llm,
+        stage: &str,
+        system: &str,
+        user_msg: &str,
+        key_body: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
         let model = client.model().to_string();
         let cost = |u: &llm::Usage| self.price(&model).map(|p| llm::cost_at(&p, u)).unwrap_or(0.0);
         let mut max_tokens = max_tokens;
         for attempt in 0..2 {
             if self.cancel.load(Ordering::SeqCst) {
                 return Err(Error::Cancelled);
+            }
+            if attempt == 0 && !self.prefetched.lock().unwrap().is_empty() {
+                let key = request_key(stage, &model, system, key_body, max_tokens);
+                // Already paid for when the batch was collected.
+                match self.prefetched.lock().unwrap().remove(&key) {
+                    Some(Prefetched::Text(t)) => return Ok(t),
+                    Some(Prefetched::Truncated) => return Err(Error::Truncated),
+                    Some(Prefetched::Refused) => return Err(Error::Refused),
+                    Some(Prefetched::NoRoom) => {
+                        max_tokens = max_tokens.saturating_mul(3).saturating_add(4000).min(32_000);
+                        continue;
+                    }
+                    None => {}
+                }
             }
             // Reserve what is really sent: thinking models get extra room.
             let held = self.reserve(&model, system, user_msg, client.max_output(max_tokens))?;
@@ -552,7 +609,19 @@ impl Pipeline {
         user_msg: &str,
         max_tokens: u32,
     ) -> Result<Reply> {
-        match self.call(client, stage, system, user_msg, max_tokens) {
+        self.call_reply_keyed(client, stage, system, user_msg, user_msg, max_tokens)
+    }
+
+    fn call_reply_keyed(
+        &self,
+        client: &dyn Llm,
+        stage: &str,
+        system: &str,
+        user_msg: &str,
+        key_body: &str,
+        max_tokens: u32,
+    ) -> Result<Reply> {
+        match self.call_keyed(client, stage, system, user_msg, key_body, max_tokens) {
             Ok(text) => match llm::parse_json_array(&text) {
                 Ok(a) => Ok(Reply::Items(a)),
                 Err(e) => {
@@ -623,7 +692,10 @@ impl Pipeline {
             Some((tin * p[0] + tout * p[1] + sys_reads * sys_tokens * p[3] + sys_tokens * p[2]) / 1e6)
         };
         let r4 = |x: f64| (x * 1e4).round() / 1e4;
-        let range = |c: Option<f64>| c.map(|c| vec![r4(c), r4(c * 1.6)]);
+        // The Batch API charges half.
+        let batch = self.batch_possible();
+        let factor = if batch { 0.5 } else { 1.0 };
+        let range = |c: Option<f64>| c.map(|c| vec![r4(c * factor), r4(c * factor * 1.6)]);
         let translate = range(cost(&tm, tr_in * frac, tr_out * thinks(&tm) * frac, batches * frac));
         let review = match &rm {
             Some(rm) => {
@@ -638,7 +710,8 @@ impl Pipeline {
             _ => None,
         };
         json!({"lines": st.lines, "todo": todo, "translate_model": tm, "review_model": rm,
-               "translate": translate, "review": review, "total": total, "spent": r4(self.p.spent_total())})
+               "translate": translate, "review": review, "total": total, "spent": r4(self.p.spent_total()),
+               "batch": batch, "batch_waiting": self.batch_waiting()})
     }
 
     // ------------------------------------------------------------ style
@@ -823,6 +896,25 @@ impl Pipeline {
         let batches = chunks(&unique, self.s.batch_size);
         let total = unique.len();
         let done = AtomicUsize::new(0);
+        // Batch API on, or a batch from an earlier run still to collect.
+        if ids.is_none() && !redo && (self.batch_on(&*client) || self.batch_waiting() > 0) {
+            let reqs = batches
+                .iter()
+                .map(|batch| {
+                    let first = index[batch[0].id.as_str()];
+                    let ctx = &live[first.saturating_sub(ctx_n)..first];
+                    let prot: Vec<Arc<Protected>> = batch.iter().map(|l| self.prot(&*eng, l)).collect();
+                    let (head, body, budget) = self.translate_request(batch, &prot, ctx, &names, &*eng, "");
+                    llm::BatchRequest {
+                        key: request_key("translate", &tm, &system, &body, budget),
+                        system: system.clone(),
+                        user: format!("{head}{body}"),
+                        max_tokens: budget,
+                    }
+                })
+                .collect();
+            self.prefetch(&*client, "translate", reqs)?;
+        }
         let msg = format!("Translating with {tm}");
         self.prog("translate", 0, total, &msg);
         self.run_parallel(batches, |batch| {
@@ -850,6 +942,7 @@ impl Pipeline {
             }
             self.p.add_results(rows)?;
         }
+        self.batch_done("translate");
         Ok(total + reused + n_copies)
     }
 
@@ -931,19 +1024,18 @@ impl Pipeline {
         Ok(rows)
     }
 
-    /// One model call. `None` if the reply was unusable.
-    #[allow(clippy::too_many_arguments)]
-    fn ask_translate(
+    /// The user message for a translation request: (context, the rest, token
+    /// limit). The context shows earlier lines and, once translated, their
+    /// English; it isn't part of the request's identity (see `call_keyed`).
+    fn translate_request(
         &self,
-        client: &dyn Llm,
-        system: &str,
         batch: &[Line],
         prot: &[Arc<Protected>],
         ctx: &[Line],
         names: &IndexMap<String, String>,
         eng: &dyn Engine,
         note: &str,
-    ) -> Result<Asked> {
+    ) -> (String, String, u32) {
         let context: Vec<Value> = ctx
             .iter()
             .map(|l| {
@@ -960,16 +1052,36 @@ impl Pipeline {
             .enumerate()
             .map(|(k, (l, pr))| json!({"i": k + 1, "who": Self::who(l, names), "jp": pr.text}))
             .collect();
-        let mut user_msg = String::new();
-        if !context.is_empty() {
-            user_msg += &format!("CONTEXT (earlier lines, do not translate):\n{}\n\n", jsonl(&context));
-        }
+        let head = if context.is_empty() {
+            String::new()
+        } else {
+            format!("CONTEXT (earlier lines, do not translate):\n{}\n\n", jsonl(&context))
+        };
+        let mut body = String::new();
         if !note.is_empty() {
-            user_msg += &format!("{note}\n\n");
+            body += &format!("{note}\n\n");
         }
-        user_msg += &format!("TRANSLATE:\n{}", jsonl(&items));
+        body += &format!("TRANSLATE:\n{}", jsonl(&items));
         let budget = prot.iter().map(|p| p.text.chars().count()).sum::<usize>() * 3 + 60 * batch.len() + 400;
-        let arr = match self.call_reply(client, "translate", system, &user_msg, budget.clamp(1500, 16000) as u32)? {
+        (head, body, budget.clamp(1500, 16000) as u32)
+    }
+
+    /// One model call. `None` if the reply was unusable.
+    #[allow(clippy::too_many_arguments)]
+    fn ask_translate(
+        &self,
+        client: &dyn Llm,
+        system: &str,
+        batch: &[Line],
+        prot: &[Arc<Protected>],
+        ctx: &[Line],
+        names: &IndexMap<String, String>,
+        eng: &dyn Engine,
+        note: &str,
+    ) -> Result<Asked> {
+        let (head, body, budget) = self.translate_request(batch, prot, ctx, names, eng, note);
+        let user_msg = format!("{head}{body}");
+        let arr = match self.call_reply_keyed(client, "translate", system, &user_msg, &body, budget)? {
             Reply::Items(arr) => arr,
             Reply::Unusable => return Ok(Asked::Unusable),
             Reply::Refused => return Ok(Asked::Refused),
@@ -1042,8 +1154,24 @@ impl Pipeline {
         let total = todo.len();
         let done = AtomicUsize::new(0);
         let changed = AtomicUsize::new(0);
+        let batches = chunks(&todo, 30);
+        if ids.is_none() && (self.batch_on(&*client) || self.batch_waiting() > 0) {
+            let reqs = batches
+                .iter()
+                .map(|batch| {
+                    let (body, budget) = self.review_request(batch, &names, &*eng);
+                    llm::BatchRequest {
+                        key: request_key("review", &rm, &system, &body, budget),
+                        system: system.clone(),
+                        user: body,
+                        max_tokens: budget,
+                    }
+                })
+                .collect();
+            self.prefetch(&*client, "review", reqs)?;
+        }
         self.prog("review", 0, total, format!("Reviewing with {rm}"));
-        self.run_parallel(chunks(&todo, 30), |batch| {
+        self.run_parallel(batches, |batch| {
             let rows = self.review_batch(&*client, &system, &batch, &names, &*eng)?;
             let c = rows.iter().filter(|r| r.stage == "review").count();
             self.p.add_results(rows)?;
@@ -1052,7 +1180,24 @@ impl Pipeline {
             self.prog("review", d, total, format!("Reviewing with {rm} ({ch} lines improved)"));
             Ok(())
         })?;
+        self.batch_done("review");
         Ok(total)
+    }
+
+    /// The user message for a review request and its token limit.
+    fn review_request(&self, batch: &[Line], names: &IndexMap<String, String>, eng: &dyn Engine) -> (String, u32) {
+        let items: Vec<Value> = batch
+            .iter()
+            .map(|l| {
+                let en = self.p.result(&l.id).map(|r| r.en_ph.clone()).unwrap_or_default();
+                (l, en)
+            })
+            .enumerate()
+            .map(|(k, (l, en))| json!({"i": k + 1, "who": Self::who(l, names), "jp": self.prot(eng, l).text, "en": en}))
+            .collect();
+        let en_chars: usize = items.iter().map(|i| i["en"].as_str().unwrap_or("").chars().count()).sum();
+        let budget = en_chars + 40 * batch.len() + 400;
+        (jsonl(&items), budget.clamp(1500, 16000) as u32)
     }
 
     fn review_batch(
@@ -1065,14 +1210,8 @@ impl Pipeline {
     ) -> Result<Vec<ResultRow>> {
         let prot: Vec<Arc<Protected>> = batch.iter().map(|l| self.prot(eng, l)).collect();
         let current: Vec<Arc<ResultRow>> = batch.iter().map(|l| self.p.result(&l.id).unwrap()).collect();
-        let items: Vec<Value> = batch
-            .iter()
-            .enumerate()
-            .map(|(k, l)| json!({"i": k + 1, "who": Self::who(l, names), "jp": prot[k].text, "en": current[k].en_ph}))
-            .collect();
-        let budget = current.iter().map(|r| r.en_ph.chars().count()).sum::<usize>() + 40 * batch.len() + 400;
-        let Some(arr) = self.call_array(client, "review", system, &jsonl(&items), budget.clamp(1500, 16000) as u32)?
-        else {
+        let (body, budget) = self.review_request(batch, names, eng);
+        let Some(arr) = self.call_array(client, "review", system, &body, budget)? else {
             if batch.len() > 1 {
                 let mid = batch.len() / 2;
                 let mut a = self.review_batch(client, system, &batch[..mid], names, eng)?;

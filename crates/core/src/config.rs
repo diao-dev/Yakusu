@@ -141,6 +141,9 @@ pub struct Settings {
     pub batch_size: usize,
     pub context_lines: usize,
     pub parallel: usize,
+    /// Send translation and review through the provider's Batch API: half
+    /// price, answers within 24 hours (usually much sooner).
+    pub batch_api: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_game: Option<String>,
     /// Anything else the interface stores.
@@ -163,6 +166,7 @@ impl Default for Settings {
             batch_size: 40,
             context_lines: 10,
             parallel: 4,
+            batch_api: false,
             last_game: None,
             extra: Map::new(),
         }
