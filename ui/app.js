@@ -987,18 +987,18 @@
   }));
 
   // Pre-repack check: free, offline, every line.
-  const LINT_KINDS = [['code_errors', 'broken codes'], ['japanese_left', 'Japanese left in'],
-    ['encoding_loss', 'characters the game can\'t show'], ['overflow', 'too long for the box'], ['glossary_issues', 'name spellings']];
+  const LINT_KINDS = [['code_errors', 'Broken game codes'], ['japanese_left', 'Japanese left in'],
+    ['encoding_loss', 'Characters the game can\'t show'], ['overflow', 'Too long for the text box'], ['glossary_issues', 'Name spellings']];
   $('#lintRun').addEventListener('click', () => safe(async () => {
     const r = await call('lint');
     const found = LINT_KINDS.filter(([k]) => r[k]);
     const go = (f) => { linesState.filter = f; linesState.page = 0; loadLines(); };
     const card = h('div', { class: 'lint ' + (found.length ? 'warn' : 'ok'), role: 'status' },
       h('div', { class: 'lint-head' },
-        h('b', { text: found.length ? `${plural(r.translated - r.clean, 'line')} need a look before you rebuild` : `All ${num(r.translated)} translated lines look ready` }),
+        h('b', { text: found.length ? `${plural(r.translated - r.clean, 'line')} ${r.translated - r.clean === 1 ? 'needs' : 'need'} a look before you rebuild` : `All ${num(r.translated)} translated lines look ready` }),
         h('button', { class: 'mini', title: 'Dismiss', 'aria-label': 'Dismiss', onclick: () => $('#lintSummary').replaceChildren() }, '×')),
-      found.length ? h('ul', null, ...found.map(([k, label]) => h('li', null, h('b', { text: num(r[k]) }), ` ${label}`,
-        k === 'encoding_loss' ? ` (${r.encoding})` : null))) : null,
+      found.length ? h('ul', null, ...found.map(([k, label]) => h('li', null, `${label}${k === 'encoding_loss' ? ` (${r.encoding})` : ''}: `,
+        h('b', { text: num(r[k]) })))) : null,
       r.untranslated ? h('p', { text: `${plural(r.untranslated, 'line')} not translated yet.` }) : null,
       h('div', { class: 'lint-links' },
         h('button', { class: 'btn btn-quiet', onclick: () => go('problems') }, 'Problems'),
@@ -1053,6 +1053,7 @@
     $('#retranslatePage').textContent = nr === 1 ? 'Retranslate this line' : `Retranslate these ${num(nr)} lines`;
     $('#retranslatePage').disabled = !nr;
     list.replaceChildren(...(r.rows.length ? r.rows.map(lineRow) : [h('div', { class: 'empty-state', text: linesState.q ? 'No lines match that search.' : 'Nothing here.' })]));
+    $$('textarea', list).forEach(fitHeight);
     const pages = Math.max(1, Math.ceil(r.total / r.per));
     $('#pager').replaceChildren(h('span', { text: plural(r.total, 'line') }),
       h('button', { class: 'btn btn-quiet', disabled: r.page <= 0, onclick: () => { linesState.page--; loadLines(); } }, 'Previous'),
@@ -1061,9 +1062,15 @@
   }
   const list_has_ref = () => !!(S && S.project && S.project.reference_count);
   const STAGE_NAME = { translate: 'Translated', review: 'Improved in review', reviewed: 'Reviewed', fit: 'Shortened to fit', manual: 'Edited by you', cleared: 'Queued to translate again' };
+  // A line's English box grows to show all of it.
+  function fitHeight(ta) {
+    ta.style.height = 'auto';
+    ta.style.height = `${ta.scrollHeight + 2}px`;
+  }
   function lineRow(r) {
     const ta = h('textarea', { 'aria-label': 'English', placeholder: r.skip ? '' : 'Not translated yet' });
     ta.value = r.en || '';
+    ta.addEventListener('input', () => fitHeight(ta));
     const meta = h('div', { class: 'meta' });
     if (STAGE_NAME[r.stage]) meta.append(h('span', { text: STAGE_NAME[r.stage] }));
     if (r.problems && r.problems.length) meta.append(h('span', { class: 'bad', text: cap(r.problems.join(', ')) }));
