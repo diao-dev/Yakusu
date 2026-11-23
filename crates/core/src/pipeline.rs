@@ -236,6 +236,9 @@ impl Asked {
     }
 }
 
+/// Marks a line the subtext check has looked at (in `ResultRow::tried`).
+pub const SUBTEXT_MARK: &str = "subtext";
+
 /// Problem recorded on a line the model's safety system wouldn't translate.
 pub const DECLINED: &str = "the model declined to translate this line";
 
@@ -835,7 +838,10 @@ impl Pipeline {
         self.ensure_names(&*client)?;
         let g = self.p.glossary();
         let names = g.names.clone();
-        let system = prompts::translate_system(&self.p.style(), &g);
+        let mut system = prompts::translate_system(&self.p.style(), &g);
+        if self.prompt_refs().is_some() {
+            system = prompts::with_reference_rule(&system);
+        }
         let live = self.live_lines();
         let index: HashMap<&str, usize> = live.iter().enumerate().map(|(k, l)| (l.id.as_str(), k)).collect();
         let want: Option<HashSet<&str>> = ids.map(|v| v.iter().map(String::as_str).collect());
@@ -1046,11 +1052,18 @@ impl Pipeline {
                 c
             })
             .collect();
+        let refs = self.prompt_refs();
         let items: Vec<Value> = batch
             .iter()
             .zip(prot)
             .enumerate()
-            .map(|(k, (l, pr))| json!({"i": k + 1, "who": Self::who(l, names), "jp": pr.text}))
+            .map(|(k, (l, pr))| {
+                let mut it = json!({"i": k + 1, "who": Self::who(l, names), "jp": pr.text});
+                if let Some(r) = refs.as_ref().and_then(|m| m.get(&l.id)) {
+                    it["ref"] = json!(r);
+                }
+                it
+            })
             .collect();
         let head = if context.is_empty() {
             String::new()
@@ -1102,11 +1115,11 @@ impl Pipeline {
         names: &IndexMap<String, String>,
         probs: &[String],
     ) -> Result<(String, Vec<String>)> {
-        let user_msg = format!(
-            "TRANSLATE (the last attempt had problems: {}):\n{}",
-            probs.join(", "),
-            json!({"i": 1, "who": Self::who(l, names), "jp": pr.text})
-        );
+        let mut item = json!({"i": 1, "who": Self::who(l, names), "jp": pr.text});
+        if let Some(r) = self.prompt_refs().as_ref().and_then(|m| m.get(&l.id)) {
+            item["ref"] = json!(r);
+        }
+        let user_msg = format!("TRANSLATE (the last attempt had problems: {}):\n{}", probs.join(", "), item);
         let mut en = String::new();
         for _ in 0..2 {
             let budget = (pr.text.chars().count() * 4 + 200).max(800) as u32;
@@ -1246,6 +1259,16 @@ impl Pipeline {
     /// Final message text for one line, plus how many rows it overflows by.
     pub fn render(&self, rc: &RenderCtx, l: &Line, r: &ResultRow) -> (String, usize) {
         let lb = rc.eng.line_break_for(&l.file);
+        let text = self.restored(rc, l, r);
+        let text =
+            textfit::normalize_encoding(&text, &rc.eng.encoding(), rc.eng.straight_quotes() && rc.quotes == "auto");
+        textfit::fit(&text, &rc.text_box, lb, rc.insert_breaks)
+    }
+
+    /// The full message for one line before it's converted to the game's
+    /// encoding and wrapped: codes, quotes and the speaker name put back.
+    fn restored(&self, rc: &RenderCtx, l: &Line, r: &ResultRow) -> String {
+        let lb = rc.eng.line_break_for(&l.file);
         let pr = protect(&l.jp, lb);
         let straight = rc.eng.straight_quotes();
         let quotes: Option<(&str, &str)> = match rc.quotes.as_str() {
@@ -1261,9 +1284,7 @@ impl Pipeline {
             .as_ref()
             .and_then(|(_, jp, _)| rc.names.get(jp))
             .filter(|n| !n.is_empty() && invented_codes(n).is_empty() && !n.chars().any(char::is_control));
-        let text = restore(&pr, &r.en_ph, quotes, en_name.map(String::as_str));
-        let text = textfit::normalize_encoding(&text, &rc.eng.encoding(), straight && rc.quotes == "auto");
-        textfit::fit(&text, &rc.text_box, lb, rc.insert_breaks)
+        restore(&pr, &r.en_ph, quotes, en_name.map(String::as_str))
     }
 
     pub fn overflow_lines(&self) -> Result<Vec<String>> {
@@ -1350,6 +1371,207 @@ impl Pipeline {
             Ok(())
         })?;
         Ok(total)
+    }
+
+    // ------------------------------------------------------------ reference
+    /// The reference translation to show the model, if one is loaded and the
+    /// project hasn't turned that off.
+    fn prompt_refs(&self) -> Option<Arc<HashMap<String, String>>> {
+        if !self.p.meta().settings.use_reference_in_prompt {
+            return None;
+        }
+        Some(self.p.reference()).filter(|r| !r.is_empty())
+    }
+
+    // ------------------------------------------------------------ lint
+    /// Check every live line for what would go wrong in the game, without
+    /// asking a model: broken codes, Japanese left in, characters the game's
+    /// encoding can't show, overflowing text boxes, glossary misses.
+    pub fn lint(&self) -> Result<Value> {
+        let rc = self.render_ctx()?;
+        let enc = rc.eng.encoding();
+        let narrow = {
+            let e = enc.to_ascii_lowercase();
+            !(e.is_empty() || e.starts_with("utf") || e == "unicode")
+        };
+        let gloss = self.glossary_issues();
+        let live = self.live_lines();
+        let mut n = HashMap::<&str, usize>::new();
+        let (mut translated, mut untranslated, mut clean, mut subtext) = (0usize, 0usize, 0usize, 0usize);
+        let mut items: Vec<Value> = Vec::new();
+        self.p.with_results(|res| {
+            for l in &live {
+                let Some(r) = res.get(&l.id).filter(|r| r.translated()) else {
+                    untranslated += 1;
+                    continue;
+                };
+                translated += 1;
+                if r.subtext_note.is_some() {
+                    subtext += 1;
+                }
+                let lb = rc.eng.line_break_for(&l.file);
+                let pr = protect(&l.jp, lb);
+                let mut found: Vec<(&str, String)> = Vec::new();
+                let probs = check(&pr, Some(&r.en_ph));
+                if probs.iter().any(|p| p == "still has Japanese") {
+                    found.push(("japanese_left", "still has Japanese".into()));
+                }
+                let mut code: Vec<String> = probs.into_iter().filter(|p| p != "still has Japanese").collect();
+                let (text, over) = self.render(&rc, l, r);
+                if code.is_empty() {
+                    let foreign = foreign_codes(&pr, &text, lb);
+                    if !foreign.is_empty() {
+                        code.push(format!("would add engine code {}", foreign.join(" ")));
+                    }
+                }
+                if !code.is_empty() {
+                    found.push(("code_errors", code.join("; ")));
+                }
+                if narrow {
+                    let before = self.restored(&rc, l, r);
+                    let after =
+                        textfit::normalize_encoding(&before, &enc, rc.eng.straight_quotes() && rc.quotes == "auto");
+                    let lost: Vec<char> = before
+                        .chars()
+                        .filter(|c| *c != '?' && textfit::normalize_encoding(&c.to_string(), &enc, false) == "?")
+                        .collect();
+                    if after.matches('?').count() > before.matches('?').count() {
+                        let shown: String = lost.iter().take(5).collect();
+                        found.push(("encoding_loss", format!("{enc} can't show {shown} (becomes ?)")));
+                    }
+                }
+                if over > 0 {
+                    found.push(("overflow", format!("{over} row{} too long", if over == 1 { "" } else { "s" })));
+                }
+                if let Some(miss) = gloss.get(&l.id) {
+                    found.push(("glossary_issues", format!("should use {}", miss.join(", "))));
+                }
+                if found.is_empty() {
+                    clean += 1;
+                }
+                for (kind, detail) in found {
+                    *n.entry(kind).or_default() += 1;
+                    if items.len() < 120 {
+                        items.push(json!({"id": l.id, "file": l.file, "who": l.name, "kind": kind,
+                                          "detail": detail, "jp": pr.text, "en": r.en_ph}));
+                    }
+                }
+            }
+        });
+        let get = |k: &str| n.get(k).copied().unwrap_or(0);
+        Ok(json!({
+            "total": live.len(),
+            "translated": translated,
+            "untranslated": untranslated,
+            "clean": clean,
+            "encoding": enc,
+            "code_errors": get("code_errors"),
+            "japanese_left": get("japanese_left"),
+            "encoding_loss": get("encoding_loss"),
+            "overflow": get("overflow"),
+            "glossary_issues": get("glossary_issues"),
+            "subtext_flags": subtext,
+            "items": items,
+        }))
+    }
+
+    // ------------------------------------------------------------ subtext
+    /// Ask the editor model to point out lines whose English is stiff or loses
+    /// the Japanese's subtext, with a suggested rewrite for each. Nothing is
+    /// changed: suggestions wait on the Lines page to be accepted or dismissed.
+    /// Without `ids`, lines already checked are skipped.
+    pub fn subtext_qa(&self, ids: Option<&[String]>) -> Result<usize> {
+        let eng = self.engine()?;
+        let (tm, rm) = self.models();
+        let model = rm.unwrap_or(tm);
+        let client = self.client(&model)?;
+        let g = self.p.glossary();
+        let names = g.names.clone();
+        let system = prompts::subtext_system(&self.p.style(), &g);
+        let refs = Some(self.p.reference()).filter(|r| !r.is_empty());
+        let want: Option<HashSet<&str>> = ids.map(|v| v.iter().map(String::as_str).collect());
+        let live = self.live_lines();
+        let todo: Vec<Line> = self.p.with_results(|res| {
+            live.iter()
+                .filter(|l| want.as_ref().is_none_or(|w| w.contains(l.id.as_str())))
+                .filter(|l| {
+                    res.get(&l.id).is_some_and(|r| {
+                        r.translated() && (ids.is_some() || !r.tried.iter().any(|t| t == SUBTEXT_MARK))
+                    })
+                })
+                .cloned()
+                .collect()
+        });
+        if todo.is_empty() {
+            self.log("Every translated line has had the subtext check.");
+            return Ok(0);
+        }
+        let total = todo.len();
+        let done = AtomicUsize::new(0);
+        let flagged = AtomicUsize::new(0);
+        let msg = format!("Checking subtext with {model}");
+        self.prog("subtext", 0, total, &msg);
+        self.run_parallel(chunks(&todo, 25), |batch| {
+            let prot: Vec<Arc<Protected>> = batch.iter().map(|l| self.prot(&*eng, l)).collect();
+            let cur: Vec<Arc<ResultRow>> = batch.iter().map(|l| self.p.result(&l.id).unwrap()).collect();
+            let items: Vec<Value> = batch
+                .iter()
+                .enumerate()
+                .map(|(k, l)| {
+                    let mut it =
+                        json!({"i": k + 1, "who": Self::who(l, &names), "jp": prot[k].text, "en": cur[k].en_ph});
+                    if let Some(r) = refs.as_ref().and_then(|m| m.get(&l.id)) {
+                        it["ref"] = json!(r);
+                    }
+                    it
+                })
+                .collect();
+            let en_chars: usize = cur.iter().map(|r| r.en_ph.chars().count()).sum();
+            let budget = (en_chars / 2 + 120 * batch.len() + 400).clamp(1200, 12000) as u32;
+            let Some(arr) = self.call_array(&*client, "subtext", &system, &jsonl(&items), budget)? else {
+                // Unusable reply: these lines stay unchecked for the next run.
+                return Ok(());
+            };
+            let mut notes: HashMap<usize, (String, String)> = HashMap::new();
+            for o in &arr {
+                let Some(k) = idx_of(o).and_then(|i| i.checked_sub(1)).filter(|k| *k < batch.len()) else { continue };
+                let note = o.get("note").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let en = en_of(o).trim().to_string();
+                // A rewrite that breaks a code is never offered.
+                if !note.is_empty() && !en.is_empty() && en != cur[k].en_ph && check(&prot[k], Some(&en)).is_empty() {
+                    notes.insert(k, (note, en));
+                }
+            }
+            let rows: Vec<ResultRow> = batch
+                .iter()
+                .enumerate()
+                .map(|(k, _)| {
+                    let mut r = tried_row(None, &cur[k], SUBTEXT_MARK);
+                    // Checked again: an older suggestion is replaced, not kept.
+                    r.subtext_note = None;
+                    r.subtext_suggestion = None;
+                    if let Some((note, en)) = notes.remove(&k) {
+                        r.subtext_note = Some(note);
+                        r.subtext_suggestion = Some(en);
+                    }
+                    r
+                })
+                .collect();
+            let f = rows.iter().filter(|r| r.subtext_note.is_some()).count();
+            self.p.add_results(rows)?;
+            let d = done.fetch_add(batch.len(), Ordering::SeqCst) + batch.len();
+            let fl = flagged.fetch_add(f, Ordering::SeqCst) + f;
+            self.prog("subtext", d, total, format!("{msg} ({fl} suggestions)"));
+            Ok(())
+        })?;
+        let fl = flagged.load(Ordering::SeqCst);
+        self.log(format!(
+            "Subtext check: {} suggestion{} for {} lines. Review them on the Lines page.",
+            fmt_n(fl),
+            if fl == 1 { "" } else { "s" },
+            fmt_n(total)
+        ));
+        Ok(fl)
     }
 
     // ------------------------------------------------------------ checks

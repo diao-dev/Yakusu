@@ -56,6 +56,29 @@ Return ONLY a JSON array with the lines you changed:
 [{"i": 3, "en": "improved line"}]
 Return [] if nothing needs changing."#;
 
+/// Added to the translation rules when lines carry a reference translation.
+pub const REFERENCE_RULE: &str = r#"- Some lines include "ref": an existing translation of that line (possibly in another
+  language, possibly loose). Use it only to cross-check meaning, tone and subtext. Translate
+  from the Japanese; never copy the reference's wording or follow it where it departs from the Japanese."#;
+
+const SUBTEXT_SYSTEM: &str = r#"You are a literary subtext critic reviewing an English visual novel translation.
+For each line you get the Japanese original ("jp"), the current English ("en") and sometimes "ref",
+an existing translation of the same line to compare against.
+Flag only lines that clearly need it, usually no more than 5-15% of them:
+- stiff, word-for-word phrasing a native speaker wouldn't say,
+- an idiom, implication, joke or emotional undertone that the English flattens or loses,
+- a character's voice or register drifting from how they talk elsewhere.
+Don't flag lines that are fine, and don't nitpick. For each flagged line give a short note saying
+what is lost, and a rewrite that keeps the meaning and every placeholder like ⟦1⟧ exactly once.
+No quotation marks around lines and no line breaks.
+
+{style}
+
+{glossary}
+
+Return ONLY a JSON array: [{"i": 3, "note": "what the English loses", "en": "suggested rewrite"}]
+Return [] if every line reads well."#;
+
 pub const SHORTEN_SYSTEM: &str = r#"You fit English visual novel lines into a fixed-size text box.
 Each line comes with "max", the maximum number of characters it may use (spaces included).
 Rewrite each line to fit within its limit while keeping the meaning, tone and character voice.
@@ -103,4 +126,16 @@ pub fn translate_system(style: &str, g: &Glossary) -> String {
 
 pub fn review_system(style: &str, g: &Glossary) -> String {
     fill(REVIEW_SYSTEM, style, g)
+}
+
+pub fn subtext_system(style: &str, g: &Glossary) -> String {
+    fill(SUBTEXT_SYSTEM, style, g)
+}
+
+/// The translation prompt with the reference rule added to its rules.
+pub fn with_reference_rule(system: &str) -> String {
+    match system.find("\n\nReturn ONLY") {
+        Some(at) => format!("{}\n{}{}", &system[..at], REFERENCE_RULE, &system[at..]),
+        None => format!("{system}\n{REFERENCE_RULE}"),
+    }
 }

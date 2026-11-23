@@ -9,6 +9,7 @@
 //!   costs.jsonl    one entry per API call
 //!   style.md       style sheet (editable)
 //!   glossary.json  {"names": {jp: en}, "terms": [{jp, en}]}
+//!   reference.json {line id: text} from an existing translation (optional)
 //!   work/          engine scratch space (unpacked scripts, JSON, patched output)
 
 use crate::config::{write_json_atomic, Env};
@@ -112,6 +113,12 @@ pub struct ResultRow {
     /// "glossary:Sakura"), so a later run doesn't pay for the same attempt again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tried: Vec<String>,
+    /// What the subtext check found wrong with this English, if anything.
+    /// Only a suggestion: `en_ph` changes when the user accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtext_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtext_suggestion: Option<String>,
     #[serde(default)]
     pub t: f64,
 }
@@ -150,11 +157,13 @@ pub struct ProjSettings {
     /// auto | curly | straight | keep | none
     pub quotes: String,
     pub insert_breaks: bool,
+    /// Show the loaded reference translation to the model while translating.
+    pub use_reference_in_prompt: bool,
 }
 
 impl Default for ProjSettings {
     fn default() -> Self {
-        ProjSettings { quotes: "auto".into(), insert_breaks: true }
+        ProjSettings { quotes: "auto".into(), insert_breaks: true, use_reference_in_prompt: true }
     }
 }
 
@@ -187,6 +196,9 @@ pub struct Meta {
     pub built_lines: Option<usize>,
     pub installed_at: Option<f64>,
     pub test_file: Option<String>,
+    /// Where the reference translation came from (the file name), if one is loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_label: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
     #[serde(flatten)]
@@ -268,6 +280,7 @@ pub struct Project {
     results: RwLock<Option<HashMap<String, Arc<ResultRow>>>>,
     spent: Mutex<Option<Spent>>,
     glossary: Mutex<Option<Glossary>>,
+    reference: RwLock<Option<Arc<HashMap<String, String>>>>,
     /// Serialises appends to results.jsonl / costs.jsonl.
     files: Mutex<()>,
 }
@@ -286,6 +299,7 @@ impl Project {
             results: RwLock::new(None),
             spent: Mutex::new(None),
             glossary: Mutex::new(None),
+            reference: RwLock::new(None),
             files: Mutex::new(()),
         })
     }
@@ -513,5 +527,47 @@ impl Project {
         write_json_atomic(&self.path("glossary.json"), &serde_json::to_value(&g)?)?;
         *guard = Some(g);
         Ok(())
+    }
+
+    // -- reference translation -------------------------------------------
+    /// An existing translation of the game (another language, or an older
+    /// English patch), by line id. Shown beside the Japanese and, if the
+    /// project says so, to the model as a cross-check. Empty if none.
+    pub fn reference(&self) -> Arc<HashMap<String, String>> {
+        if let Some(r) = self.reference.read().unwrap().as_ref() {
+            return r.clone();
+        }
+        let mut guard = self.reference.write().unwrap();
+        if guard.is_none() {
+            let map: HashMap<String, String> = fs::read_to_string(self.path("reference.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            *guard = Some(Arc::new(map));
+        }
+        guard.as_ref().unwrap().clone()
+    }
+
+    pub fn reference_len(&self) -> usize {
+        self.reference().len()
+    }
+
+    pub fn set_reference(&self, map: HashMap<String, String>, label: Option<String>) -> std::io::Result<()> {
+        let mut guard = self.reference.write().unwrap();
+        write_json_atomic(&self.path("reference.json"), &serde_json::to_value(&map)?)?;
+        *guard = Some(Arc::new(map));
+        drop(guard);
+        self.update_meta(|m| m.reference_label = label)
+    }
+
+    pub fn clear_reference(&self) -> std::io::Result<()> {
+        let mut guard = self.reference.write().unwrap();
+        match fs::remove_file(self.path("reference.json")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        *guard = Some(Arc::new(HashMap::new()));
+        drop(guard);
+        self.update_meta(|m| m.reference_label = None)
     }
 }

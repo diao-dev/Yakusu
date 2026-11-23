@@ -1024,6 +1024,17 @@ pub mod fake {
             return Value::Array(arr).to_string();
         }
         let items = json_lines(user);
+        if system.starts_with("You are a literary subtext critic") {
+            // Flags the first line of each batch with a looser rewrite.
+            return match items.first() {
+                Some(it) => {
+                    let en = it["en"].as_str().unwrap_or("");
+                    let better = en.replacen("The cherry blossoms", "Blossoms", 1);
+                    json!([{"i": it["i"], "note": "Reads too literally.", "en": better}]).to_string()
+                }
+                None => "[]".into(),
+            };
+        }
         if system.starts_with("You fit English") {
             let arr: Vec<Value> = items
                 .iter()

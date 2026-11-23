@@ -247,16 +247,27 @@
           <button data-f="untranslated">Not yet</button>
           <button data-f="problems">Problems</button>
           <button data-f="reviewed">Changed in review</button>
+          <button data-f="overflow">Overflow</button>
+          <button data-f="subtext">Subtext QA <span class="count" id="subtextCount" hidden></span></button>
           <button data-f="skipped">Skipped</button>
         </div>
         <input id="lineSearch" class="input" type="search" placeholder="Search Japanese, English or speaker" aria-label="Search lines">
       </div>
       <div class="lines-tools">
         <button class="btn btn-quiet" id="retranslatePage" hidden>Retranslate the lines shown</button>
+        <button class="btn btn-quiet" id="lintRun" title="Checks every line for broken codes, Japanese left in, characters the game can't show, overflow and name spellings. Free: no model is asked.">Pre-repack check</button>
+        <button class="btn btn-quiet" id="subtextRun" title="Asks the model to point out stiff lines and lost subtext, with a suggested rewrite for each. Nothing changes until you accept a suggestion. Uses your API key.">Subtext QA</button>
         <span class="spacer"></span>
         <button class="btn btn-quiet" id="exportCsv">Export for proofreading (CSV)</button>
         <label class="btn btn-quiet file-btn">Import edited CSV<input type="file" id="importCsv" accept=".csv,text/csv"></label>
       </div>
+      <div class="ref-bar" id="refBar">
+        <label class="btn btn-quiet file-btn" title="An existing translation of this game (a Korean fan patch, an older English patch) shown beside each line. CSV with an id or japanese column, or JSON.">Load reference (CSV/JSON)<input type="file" id="refFile" accept=".csv,.json,text/csv,application/json"></label>
+        <span class="ref-status" id="refStatus"></span>
+        <label class="check" id="refPromptWrap" hidden><input type="checkbox" id="refPrompt"> Show it to the model when translating</label>
+        <button class="btn btn-quiet" id="refClear" hidden>Clear reference</button>
+      </div>
+      <div id="lintSummary"></div>
       <div class="lines-list" id="linesList"></div>
       <div class="pager" id="pager"></div>
     </section>

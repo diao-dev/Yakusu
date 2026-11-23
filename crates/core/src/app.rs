@@ -265,6 +265,15 @@ impl App {
                     .unwrap_or_default();
                 self.retranslate(ids)
             }
+            "lint" => self.pipeline()?.lint(),
+            "import_reference" => self.import_reference(s_arg(a, "text"), s_arg(a, "label")),
+            "clear_reference" => {
+                self.need_project()?.clear_reference()?;
+                Ok(json!({"ok": true}))
+            }
+            "subtext_action" => {
+                self.subtext_action(s_arg(a, "id"), a.get("accept").and_then(Value::as_bool).unwrap_or(false))
+            }
             "export_csv" => self.export_csv(),
             "import_csv" => self.import_csv(s_arg(a, "text")),
             "close" => self.close_game(),
@@ -452,8 +461,8 @@ impl App {
     fn project_state(&self, p: &Project) -> Value {
         let lines = p.lines();
         let live: Vec<&Line> = lines.iter().filter(|l| l.skip.is_empty()).collect();
-        let (done, reviewed, problems) = p.with_results(|res| {
-            let mut d = (0, 0, 0);
+        let (done, reviewed, problems, subtext) = p.with_results(|res| {
+            let mut d = (0, 0, 0, 0);
             for l in &live {
                 if let Some(r) = res.get(&l.id) {
                     if r.translated() {
@@ -464,6 +473,9 @@ impl App {
                     }
                     if !r.problems.is_empty() {
                         d.2 += 1;
+                    }
+                    if r.subtext_note.is_some() {
+                        d.3 += 1;
                     }
                 }
             }
@@ -486,6 +498,9 @@ impl App {
             "translated": done,
             "reviewed": reviewed,
             "problems": problems,
+            "subtext_flags": subtext,
+            "reference_count": p.reference_len(),
+            "reference_label": m.reference_label,
             "total": live.len(),
             "built_at": m.built_at,
             "installed": inst.installed(),
@@ -784,6 +799,9 @@ impl App {
             if let Some(v) = a.get("quotes").and_then(Value::as_str) {
                 m.settings.quotes = v.into();
             }
+            if let Some(v) = a.get("use_reference_in_prompt").and_then(Value::as_bool) {
+                m.settings.use_reference_in_prompt = v;
+            }
             if let Some(v) = a.get("test_file") {
                 m.test_file = v.as_str().filter(|s| !s.is_empty()).map(String::from);
             }
@@ -828,6 +846,9 @@ impl App {
         let names = p.glossary().names;
         let gloss =
             if matches!(flt, "glossary" | "all" | "problems") { pipe.glossary_issues() } else { HashMap::new() };
+        let over: std::collections::HashSet<String> =
+            if flt == "overflow" { pipe.overflow_lines()?.into_iter().collect() } else { Default::default() };
+        let refs = p.reference();
         let q = q.to_lowercase();
         let lines = p.lines();
         let (total, rows) = p.with_results(|res| {
@@ -842,6 +863,8 @@ impl App {
                     "translated" => tr,
                     "glossary" => gloss.contains_key(&l.id),
                     "reviewed" => r.is_some_and(|r| r.before.is_some()),
+                    "overflow" => over.contains(&l.id),
+                    "subtext" => r.is_some_and(|r| r.subtext_note.is_some()),
                     _ => true,
                 };
                 if !keep {
@@ -852,10 +875,12 @@ impl App {
                     let who = l.name.as_deref().unwrap_or("").to_lowercase();
                     let who_en =
                         l.name.as_ref().and_then(|n| names.get(n)).map(|s| s.to_lowercase()).unwrap_or_default();
+                    let rf = refs.get(&l.id).map(|s| s.to_lowercase()).unwrap_or_default();
                     if !l.jp.to_lowercase().contains(&q)
                         && !en.contains(&q)
                         && !who.contains(&q)
                         && !who_en.contains(&q)
+                        && !rf.contains(&q)
                     {
                         continue;
                     }
@@ -882,7 +907,9 @@ impl App {
                            "stage": r.map(|r| r.stage.clone()),
                            "problems": r.map(|r| r.problems.clone()).filter(|p| !p.is_empty()),
                            "skip": l.skip, "before": r.and_then(|r| r.before.clone()),
-                           "glossary": gloss.get(&l.id)})
+                           "glossary": gloss.get(&l.id), "ref": refs.get(&l.id),
+                           "subtext_note": r.and_then(|r| r.subtext_note.clone()),
+                           "subtext_suggestion": r.and_then(|r| r.subtext_suggestion.clone())})
                 })
                 .collect();
             (total, rows)
@@ -1011,6 +1038,10 @@ impl App {
                 Ok(json!({}))
             }),
             "glossary" => self.start(action, move || Ok(json!(pipe.fix_glossary()?))),
+            "subtext" => self.start(action, move || {
+                pipe.ensure_read()?;
+                Ok(json!(pipe.subtext_qa(None)?))
+            }),
             _ => user(format!("Unknown action {action}")),
         }
     }
@@ -1146,6 +1177,152 @@ impl App {
         p.add_results(rows)?;
         self.log(&format!("Imported {changed} edited lines from CSV."));
         Ok(json!({"changed": changed, "problems": problems, "unknown": unknown}))
+    }
+
+    /// Accept a subtext suggestion (it becomes the line's English, the old
+    /// English kept as "before") or dismiss it.
+    fn subtext_action(&self, id: &str, accept: bool) -> Result<Value> {
+        let p = self.need_project()?;
+        let Some(cur) = p.result(id) else { return user("Line not found.") };
+        let Some(suggestion) = cur.subtext_suggestion.clone().filter(|_| cur.subtext_note.is_some()) else {
+            return user("That line has no suggestion to act on.");
+        };
+        let mut r = (*cur).clone();
+        r.subtext_note = None;
+        r.subtext_suggestion = None;
+        r.t = 0.0;
+        if accept {
+            let line = p.lines().iter().find(|l| l.id == id).cloned();
+            let Some(line) = line else { return user("Line not found.") };
+            let eng = self.pipeline()?.engine()?;
+            let probs: Vec<String> = check(&protect(&line.jp, eng.line_break_for(&line.file)), Some(&suggestion))
+                .into_iter()
+                .filter(|x| x != "still has Japanese")
+                .collect();
+            if !probs.is_empty() {
+                return user(format!(
+                    "That suggestion would break the line ({}). Edit it by hand instead.",
+                    probs.join(", ")
+                ));
+            }
+            r.before = Some(cur.en_ph.clone());
+            r.en_ph = suggestion;
+            r.stage = "manual".into();
+            r.model = "subtext".into();
+            r.src = Some(line.jp.clone());
+            r.problems = vec![];
+        }
+        p.add_results(vec![r])?;
+        Ok(json!({"ok": true}))
+    }
+
+    /// Load a reference translation: an existing translation of this game
+    /// (another language, an older patch) shown beside each line.
+    ///
+    /// Accepted: CSV with an "id" or "japanese" column and a text column
+    /// (reference, ref, kr, korean, translation, english, text or message);
+    /// a JSON array of strings (one per line, in order) or of objects
+    /// (matched by "id", by "jp"/"japanese", else by position); or a JSON
+    /// object {id or Japanese: text}.
+    fn import_reference(&self, text: &str, label: &str) -> Result<Value> {
+        const REF_COLS: &[&str] = &["reference", "ref", "kr", "korean", "translation", "english", "text", "message"];
+        let p = self.need_project()?;
+        let eng = self.pipeline()?.engine()?;
+        let live = p.live_lines();
+        let by_id: HashMap<&str, usize> = live.iter().enumerate().map(|(k, l)| (l.id.as_str(), k)).collect();
+        // Japanese as written, without the game's codes, and without spaces.
+        let norm = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let mut by_jp: HashMap<String, Vec<usize>> = HashMap::new();
+        for (k, l) in live.iter().enumerate() {
+            let pr = protect(&l.jp, eng.line_break_for(&l.file));
+            let mut keys = vec![norm(&l.jp), norm(&pr.text), norm(&crate::protect::strip_codes(&pr.text))];
+            keys.sort();
+            keys.dedup();
+            for key in keys.into_iter().filter(|k| !k.is_empty()) {
+                by_jp.entry(key).or_default().push(k);
+            }
+        }
+        let mut map: HashMap<String, String> = HashMap::new();
+        let (mut rows, mut unmatched) = (0usize, 0usize);
+        let mut put = |targets: Vec<usize>, value: &str, map: &mut HashMap<String, String>| {
+            let v = value.trim();
+            if v.is_empty() {
+                return;
+            }
+            if targets.is_empty() {
+                unmatched += 1;
+            }
+            for k in targets {
+                map.insert(live[k].id.clone(), v.to_string());
+            }
+        };
+        let find = |id: Option<&str>, jp: Option<&str>| -> Option<Vec<usize>> {
+            if let Some(k) = id.and_then(|i| by_id.get(i.trim())) {
+                return Some(vec![*k]);
+            }
+            jp.map(|j| by_jp.get(&norm(j)).cloned().unwrap_or_default())
+        };
+        let body = text.trim_start_matches('\u{feff}').trim();
+        if body.starts_with('[') || body.starts_with('{') {
+            let v: Value =
+                serde_json::from_str(body).map_err(|e| Error::User(format!("That JSON couldn't be read: {e}")))?;
+            match v {
+                Value::Array(items) => {
+                    for (pos, it) in items.iter().enumerate() {
+                        rows += 1;
+                        let (targets, value) = match it {
+                            Value::String(s) => (live.get(pos).map(|_| vec![pos]).unwrap_or_default(), s.clone()),
+                            Value::Object(o) => {
+                                let get = |k: &str| o.get(k).and_then(Value::as_str);
+                                let jp = get("jp").or_else(|| get("japanese"));
+                                let value = REF_COLS.iter().find_map(|c| get(c)).unwrap_or("").to_string();
+                                let targets = find(get("id"), jp)
+                                    .unwrap_or_else(|| live.get(pos).map(|_| vec![pos]).unwrap_or_default());
+                                (targets, value)
+                            }
+                            _ => continue,
+                        };
+                        put(targets, &value, &mut map);
+                    }
+                }
+                Value::Object(o) => {
+                    for (k, v) in o {
+                        rows += 1;
+                        let Some(value) = v.as_str() else { continue };
+                        let targets = find(Some(&k), Some(&k)).unwrap_or_default();
+                        put(targets, value, &mut map);
+                    }
+                }
+                _ => return user("That JSON should be a list of lines or an object of {line: text}."),
+            }
+        } else {
+            let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(body.as_bytes());
+            let headers = rdr.headers().map_err(|e| Error::User(format!("That CSV couldn't be read: {e}")))?.clone();
+            let col = |name: &str| headers.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
+            let ci = col("id");
+            let cj = col("japanese").or_else(|| col("jp"));
+            let Some(cr) = REF_COLS.iter().find_map(|c| col(c)) else {
+                return user(
+                    "That CSV needs a column with the reference text, named reference, translation, korean, english or text.",
+                );
+            };
+            if ci.is_none() && cj.is_none() {
+                return user("That CSV needs an \"id\" or \"japanese\" column to match its rows to the game's lines.");
+            }
+            for rec in rdr.records().flatten() {
+                rows += 1;
+                let targets = find(ci.and_then(|c| rec.get(c)), cj.and_then(|c| rec.get(c))).unwrap_or_default();
+                put(targets, rec.get(cr).unwrap_or(""), &mut map);
+            }
+        }
+        if map.is_empty() {
+            return user("None of that file's lines matched this game's lines, so nothing was loaded.");
+        }
+        let label = Some(label.trim()).filter(|l| !l.is_empty()).map(String::from);
+        let matched = map.len();
+        p.set_reference(map, label)?;
+        self.log(&format!("Loaded a reference translation for {matched} of {} lines.", live.len()));
+        Ok(json!({"matched": matched, "rows": rows, "unmatched": unmatched, "total": live.len()}))
     }
 
     fn launch(&self) -> Result<Value> {

@@ -165,7 +165,8 @@
 
   const DONE_MSG = { extract: 'Scripts read.', style: 'Style sheet drafted.', refit: 'Applied to the game.',
     restore: 'Original game restored.', build: 'Patch rebuilt and installed.', glossary: 'Name spellings fixed.',
-    retranslate: 'Lines retranslated.', translate: 'Translation saved.', review: 'Review finished.', fit: 'Long lines shortened.' };
+    retranslate: 'Lines retranslated.', translate: 'Translation saved.', review: 'Review finished.', fit: 'Long lines shortened.',
+    subtext: 'Subtext check finished. Suggestions are under Subtext QA.' };
   function onJobDone() {
     const j = S.job;
     if (j.need) needSetup(j.need, j.error);
@@ -219,11 +220,13 @@
     renderSettings();
     renderTest();
     if (view === 'activity') renderLog();
+    if (view === 'lines') loadLines();
   }
 
   const STAGE = { extract: 'Reading the scripts', style: 'Writing the style sheet', translate: 'Translating', review: 'Reviewing',
     fit: 'Fitting text to the box', build: 'Building the patch', test: 'Test patch', auto: 'Getting ready', refit: 'Building the patch',
-    restore: 'Restoring', glossary: 'Checking name spellings', names: 'Naming the characters', retranslate: 'Retranslating' };
+    restore: 'Restoring', glossary: 'Checking name spellings', names: 'Naming the characters', retranslate: 'Retranslating',
+    subtext: 'Checking subtext' };
   function renderJob() {
     const j = S.job || {};
     $('#jobbar').hidden = !j.running;
@@ -262,7 +265,7 @@
 
   // A failed job leaves a banner until dismissed, with a way to try again.
   let bannerDismissed = null;
-  const RETRYABLE = ['extract', 'style', 'test', 'refit', 'auto', 'translate', 'review', 'fit', 'build', 'restore', 'glossary'];
+  const RETRYABLE = ['extract', 'style', 'test', 'refit', 'auto', 'translate', 'review', 'fit', 'build', 'restore', 'glossary', 'subtext'];
   function renderBanner() {
     const j = S.job || {};
     // The game's own card explains a failed read; setup problems open their control.
@@ -420,7 +423,14 @@
     if (reading) {
       card.append(h('p', { class: 'note reading', role: 'status', text: 'Reading the scripts… this takes a moment for big games.' }));
     } else if (readError && !needTitle) {
-      card.append(h('div', { class: 'callout bad' }, h('b', { text: 'Couldn\'t read the scripts. ' }), readError));
+      card.append(h('div', { class: 'callout bad' }, h('b', { text: 'Couldn\'t read the scripts. ' }), readError,
+        h('div', { class: 'callout-actions' },
+          h('button', { class: 'btn btn-quiet', onclick: () => show('activity') }, 'View Activity log'),
+          h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
+            const logs = (S.logs || []).slice(-40).map((l) => l.m).join('\n');
+            await navigator.clipboard.writeText(`${readError}\n\n${p.game_dir}\n${logs}`);
+            toast('Error copied, with the recent Activity log.');
+          }) }, 'Copy error'))));
     }
     if (p.stats && !reading) {
       const st = p.stats;
@@ -768,7 +778,7 @@
   }
 
   function launch() { safe(async () => { const r = await call('launch'); toast(`Started ${r.launched}.`); }); }
-  const NEEDS_MODEL = ['auto', 'test', 'style', 'translate', 'review', 'fit', 'glossary'];
+  const NEEDS_MODEL = ['auto', 'test', 'style', 'translate', 'review', 'fit', 'glossary', 'subtext'];
   function run(action) {
     safe(async () => {
       if (!S.project) throw new Error('Choose a game folder first.');
@@ -944,17 +954,69 @@
     loadLines();
   }));
 
+  // Pre-repack check: free, offline, every line.
+  const LINT_KINDS = [['code_errors', 'broken codes'], ['japanese_left', 'Japanese left in'],
+    ['encoding_loss', 'characters the game can\'t show'], ['overflow', 'too long for the box'], ['glossary_issues', 'name spellings']];
+  $('#lintRun').addEventListener('click', () => safe(async () => {
+    const r = await call('lint');
+    const found = LINT_KINDS.filter(([k]) => r[k]);
+    const go = (f) => { linesState.filter = f; linesState.page = 0; loadLines(); };
+    const card = h('div', { class: 'lint ' + (found.length ? 'warn' : 'ok'), role: 'status' },
+      h('div', { class: 'lint-head' },
+        h('b', { text: found.length ? `${plural(r.translated - r.clean, 'line')} need a look before you rebuild` : `All ${num(r.translated)} translated lines look ready` }),
+        h('button', { class: 'mini', title: 'Dismiss', 'aria-label': 'Dismiss', onclick: () => $('#lintSummary').replaceChildren() }, '×')),
+      found.length ? h('ul', null, ...found.map(([k, label]) => h('li', null, h('b', { text: num(r[k]) }), ` ${label}`,
+        k === 'encoding_loss' ? ` (${r.encoding})` : null))) : null,
+      r.untranslated ? h('p', { text: `${plural(r.untranslated, 'line')} not translated yet.` }) : null,
+      h('div', { class: 'lint-links' },
+        h('button', { class: 'btn btn-quiet', onclick: () => go('problems') }, 'Problems'),
+        h('button', { class: 'btn btn-quiet', onclick: () => go('overflow') }, 'Overflow'),
+        r.subtext_flags ? h('button', { class: 'btn btn-quiet', onclick: () => go('subtext') }, `Subtext QA (${num(r.subtext_flags)})`) : null));
+    $('#lintSummary').replaceChildren(card);
+  }));
+  $('#subtextRun').addEventListener('click', () => run('subtext'));
+
+  // Reference translation shown beside each line.
+  $('#refFile').addEventListener('change', (e) => safe(async () => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    const r = await call('import_reference', { text: await f.text(), label: f.name });
+    toast(`Reference loaded for ${plural(r.matched, 'line')}` + (r.unmatched ? `; ${plural(r.unmatched, 'row')} didn't match this game` : '') + '.');
+    await refresh();
+    loadLines();
+  }));
+  $('#refClear').addEventListener('click', () => safe(async () => { await call('clear_reference'); await refresh(); loadLines(); }));
+  $('#refPrompt').addEventListener('change', (e) => safe(async () => {
+    await call('box', { use_reference_in_prompt: e.target.checked });
+    await refresh();
+  }));
+  function renderRefBar() {
+    const p = S && S.project;
+    const n = (p && p.reference_count) || 0;
+    $('#refStatus').textContent = n ? `${p.reference_label || 'Reference'}: ${plural(n, 'line')} matched` : '';
+    $('#refClear').hidden = !n;
+    $('#refPromptWrap').hidden = !n;
+    $('#refPrompt').checked = !!(p && p.settings && p.settings.use_reference_in_prompt !== false);
+    const c = $('#subtextCount');
+    const flags = (p && p.subtext_flags) || 0;
+    c.hidden = !flags;
+    c.textContent = num(flags);
+  }
+
   async function loadLines() {
     $$('#lineFilter button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.f === linesState.filter)));
-    $('#retranslatePage').hidden = !['problems', 'untranslated', 'reviewed'].includes(linesState.filter);
+    $('#retranslatePage').hidden = !['problems', 'untranslated', 'reviewed', 'overflow', 'subtext'].includes(linesState.filter);
     const list = $('#linesList');
     if (!S || !S.project || !S.project.extracted) {
       list.replaceChildren(h('div', { class: 'empty-state' }, svgUse('branch'), 'Open a game on the Translate page. Its lines will be listed here.'));
       $('#pager').replaceChildren();
       return;
     }
+    renderRefBar();
     const r = await call('lines', { filter: linesState.filter, q: linesState.q, page: linesState.page });
     lastRows = r.rows;
+    list.classList.toggle('has-ref', (S.project.reference_count || 0) > 0);
     const nr = r.rows.filter((x) => !x.skip).length;
     $('#retranslatePage').textContent = nr === 1 ? 'Retranslate this line' : `Retranslate these ${num(nr)} lines`;
     $('#retranslatePage').disabled = !nr;
@@ -965,6 +1027,7 @@
       h('span', { text: `Page ${r.page + 1} of ${pages}` }),
       h('button', { class: 'btn btn-quiet', disabled: r.page + 1 >= pages, onclick: () => { linesState.page++; loadLines(); } }, 'Next'));
   }
+  const list_has_ref = () => !!(S && S.project && S.project.reference_count);
   const STAGE_NAME = { translate: 'Translated', review: 'Improved in review', reviewed: 'Reviewed', fit: 'Shortened to fit', manual: 'Edited by you', cleared: 'Queued to translate again' };
   function lineRow(r) {
     const ta = h('textarea', { 'aria-label': 'English', placeholder: r.skip ? '' : 'Not translated yet' });
@@ -975,6 +1038,19 @@
     if (r.glossary && r.glossary.length) meta.append(h('span', { class: 'gloss', text: `Should use ${r.glossary.join(', ')}` }));
     if (r.skip) meta.append(h('span', { text: `Skipped: ${r.skip}` }));
     const before = r.before && r.before !== r.en ? h('div', { class: 'before', title: 'Before review', text: r.before }) : null;
+    const subtext = r.subtext_note ? h('div', { class: 'subtext-card' },
+      h('div', { class: 'note', text: r.subtext_note }),
+      h('div', { class: 'proposal', text: r.subtext_suggestion || '' }),
+      h('div', { class: 'subtext-actions' },
+        h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
+          await call('subtext_action', { id: r.id, accept: true });
+          toast('Suggestion used. Rebuild the patch to put it in the game.');
+          await refresh(); loadLines();
+        }) }, 'Accept'),
+        h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
+          await call('subtext_action', { id: r.id, accept: false });
+          await refresh(); loadLines();
+        }) }, 'Dismiss'))) : null;
     ta.addEventListener('change', () => safe(async () => {
       const res = await call('line', { id: r.id, en: ta.value });
       meta.replaceChildren(res.problems && res.problems.length
@@ -984,7 +1060,8 @@
     return h('div', { class: 'ln' + (r.skip ? ' skipped' : '') },
       h('div', { class: 'who', title: r.file, text: r.who || 'Narration' }),
       h('div', { class: 'src', lang: 'ja', text: r.jp }),
-      h('div', null, ta, before, meta),
+      list_has_ref() ? h('div', { class: 'ref', 'data-label': 'Reference', text: r.ref || '' }) : null,
+      h('div', { class: 'en' }, ta, before, subtext, meta),
       h('div', { class: 'actions' },
         r.skip ? null : h('button', { class: 'mini', title: 'Translate this line again', 'aria-label': 'Translate this line again',
           onclick: () => safe(async () => { await call('retranslate', { ids: [r.id] }); refresh(); }) }, '↻'),
