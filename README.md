@@ -28,16 +28,22 @@ Windows 10 or 11 (64-bit). It uses the Edge WebView2 runtime that Windows alread
 
 Not sure yet? *Try 150 lines first* installs a small test patch to check in the game. *Remove the patch* puts the original game back, byte for byte.
 
-Everything else is optional: edit the style sheet and names, adjust the text box, or proofread lines one by one.
+Everything else is optional: edit the style sheet, names and character voices, adjust the text box, or proofread lines one by one.
+
+If a game won't open, *Run Game Doctor* (on the Activity page, or under the error) checks the bundled tools and the game folder and puts it all in one report you can copy. Picking the folder above the game (where an unzipped download often leaves you) works too.
+
+![The Lines page: Japanese, a Korean reference translation and the English side by side, a pre-repack check, and a subtext suggestion to accept or dismiss](docs/lines.png)
 
 ## What it handles
 
-- **Engines:** Kirikiri (including ~500 encrypted games), LiveMaker, TyranoScript (loose, app.asar, package.nw or packed into the .exe), RPG Maker 2000, 2003, XP, VX, VX Ace, MV and MZ (messages, choices and database, including encrypted .rgss archives), Unity games made with Naninovel (experimental), FAVORITE, Artemis, BGI, YU-RIS, QLiE, Circus, Escu:de, plus CatSystem2 and Softpal with one manual step. Anything else works through *Use extracted script files instead*.
-- **Quality:** a style sheet and name glossary every batch follows, a review pass by a stronger model, and a pass that rewrites lines too long for the game's text box. All of it runs from the one button.
-- **Safety:** game codes are protected and checked on every line, and checked again right before the patch is written, so a model can't slip a command into the game. Archives can't write outside their folder, backups of the originals are never overwritten, removing a patch checks every backup before touching the game, and a failed re-read keeps the previous one. Progress is saved as it goes (stop any time).
+- **Engines:** Kirikiri (including ~500 encrypted games, and archives with unusual layouts), LiveMaker, TyranoScript (loose, app.asar, package.nw or packed into the .exe), RPG Maker 2000, 2003, XP, VX, VX Ace, MV and MZ (messages, choices and database, including encrypted .rgss archives), Unity games made with Naninovel (experimental), FAVORITE, Artemis, BGI, YU-RIS, QLiE, Circus, Escu:de, plus CatSystem2 and Softpal with one manual step. Anything else works through *Use extracted script files instead*.
+- **Quality:** a style sheet, name glossary and character voices (pronouns, how each one talks, what they call each other) that every batch follows; batches follow the script in order, so each one sees the English of the lines just before it; a review pass by a stronger model that sees the scene too; and a pass that rewrites lines too long for the game's text box. All of it runs from the one button. Optional *smart memory* translates short replies like 「うん」 in their scene instead of reusing one translation everywhere.
+- **Safety:** game codes are protected and checked on every line, and checked again right before the patch is written, so a model can't slip a command into the game. Archives can't write outside their folder, backups of the originals are never overwritten, removing a patch checks every backup before touching the game, and a failed re-read keeps the previous one. Read-only game files (common when copied from a disc) and brief antivirus locks are handled. Progress is saved as it goes (stop any time).
 - **Batch API (optional):** with Claude or Gemini, the whole translation and review can go out as one batch job at half price. Answers take minutes to 24 hours; Yakusu can be closed meanwhile and collects them on the next run.
 - **Spending limit:** set a cap and Yakusu stops before a request could cross it. For models it has no price for, enter the price in Settings; it won't run a capped job it can't count.
-- **Proofreading:** search and edit every line, or export a CSV and import it back.
+- **Proofreading (Lines page):** search and edit every line, or export a CSV and import it back. Load an existing translation (a Korean fan patch, an older English patch; CSV or JSON) to show beside each line and, if you like, to the model as a cross-check. *Pre-repack check* scans every line for free (no model) for broken game codes, Japanese left in, characters the game's font encoding can't show, overflowing text and name spellings. *Subtext QA* asks the model to point out stiff lines and lost double meanings, with a rewrite you accept or dismiss; nothing changes on its own.
+- **Text box:** measured from the script; adjust it and preview the English exactly as the game will wrap it. Options for games with a proportional font, and a bilingual mode that shows the Japanese under the English (handy for learning).
+- **Sharing:** *Export patch (.zip)* packs the built patch with install instructions.
 
 Light (sakura) and dark (yozakura) themes; switch at the bottom of the sidebar.
 
