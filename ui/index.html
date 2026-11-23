@@ -146,6 +146,8 @@
         <p class="hint">Bigger requests are a little cheaper. More at once is faster but can hit your provider's rate limit.</p>
         <label class="check"><input type="checkbox" id="batchApi"> Use the Batch API (half price, slower)</label>
         <p class="hint">Claude and Gemini only. The whole translation, then the review, goes out as one job and costs half as much. Answers usually take minutes to an hour, at most 24 hours. You can close Yakusu while it waits; it collects them next time. The 150-line test and single-line retranslations still run right away.</p>
+        <label class="check"><input type="checkbox" id="smartMemory"> Translate short lines fresh in context</label>
+        <p class="hint">Yakusu normally translates a repeated line once and reuses it. Short replies like 「うん」 or 「そうだね」 can mean different things in different scenes: with this on, they're translated in their scene every time. Costs a little more.</p>
       </div>
       <p class="hint" id="versionLine"></p>
     </section>
@@ -173,6 +175,12 @@
           <table class="names"><thead><tr><th>Japanese</th><th>English</th></tr></thead><tbody id="termsBody"></tbody></table>
           <button class="btn btn-quiet" id="addTerm">Add a term</button>
         </div>
+      </div>
+      <div class="field-group">
+        <div class="label">Character voices and address rules</div>
+        <p class="hint">How each main character talks, sent with every batch so their voice stays the same. "Calls" is how they address the others, for example <span lang="ja">大雅</span>=Taiga-kun; <span lang="ja">先生</span>=Ms. Aoi.</p>
+        <table class="names chars"><thead><tr><th>Japanese</th><th>English</th><th>Pronouns</th><th>Voice</th><th>Calls</th></tr></thead><tbody id="charsBody"></tbody></table>
+        <button class="btn btn-quiet" id="addChar">Add a character</button>
       </div>
       <p class="hint" id="styleSaved">Changes save automatically.</p>
     </section>
@@ -225,12 +233,15 @@
           </select>
         </label>
         <label class="check"><input type="checkbox" id="insertBreaks"> Insert line breaks</label>
+        <label class="check" title="Turn on if the game shows English in a font where i is narrower than m. More words then fit on a line."><input type="checkbox" id="proportionalFont"> The game uses a proportional font</label>
+        <label class="check" title="Each line shows the English with the original Japanese under it. Takes more room in the box."><input type="checkbox" id="bilingualMode"> Show the Japanese under the English</label>
       </div>
       <p class="hint" id="boxHint"></p>
       <div class="row-actions">
         <button class="btn btn-primary" id="applyFit">Apply to the game</button>
         <button class="btn" id="launch1">Launch the game</button>
         <button class="btn btn-quiet danger" id="restore1">Remove the patch</button>
+        <button class="btn btn-quiet" id="exportPatchZip" title="The built patch as one .zip with install instructions, to keep or share.">Export patch (.zip)</button>
       </div>
     </section>
 
@@ -275,6 +286,11 @@
     <!-- Activity -->
     <section class="view wide" data-view="activity">
       <header class="view-head"><h1>Activity</h1><p>What Yakusu has been doing, including output from the tools it runs.</p></header>
+      <div class="row-actions">
+        <button class="btn" id="runDoctor" title="Checks the bundled tools and the game folder, and puts everything in one report. Changes nothing.">Run Game Doctor</button>
+        <button class="btn btn-quiet" id="copyDiag" hidden>Copy diagnostics</button>
+      </div>
+      <pre class="log diag" id="diagBox" hidden></pre>
       <pre class="log" id="log"></pre>
     </section>
   </main>

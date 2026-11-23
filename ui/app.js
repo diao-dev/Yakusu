@@ -425,6 +425,7 @@
     } else if (readError && !needTitle) {
       card.append(h('div', { class: 'callout bad' }, h('b', { text: 'Couldn\'t read the scripts. ' }), readError,
         h('div', { class: 'callout-actions' },
+          h('button', { class: 'btn btn-quiet', onclick: () => { show('activity'); runDoctor(); } }, 'Run Game Doctor'),
           h('button', { class: 'btn btn-quiet', onclick: () => show('activity') }, 'View Activity log'),
           h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
             const logs = (S.logs || []).slice(-40).map((l) => l.m).join('\n');
@@ -615,10 +616,16 @@
     toast(e.target.checked ? 'Batch API on: half price, answers within 24 hours.' : 'Batch API off.');
     estimates = null; loadEstimates();
   }));
+  $('#smartMemory').addEventListener('change', (e) => safe(async () => {
+    await call('settings', { smart_memory: e.target.checked });
+    toast(e.target.checked ? 'Short lines will be translated in their scene.' : 'Repeated short lines will reuse one translation.');
+    estimates = null; loadEstimates();
+  }));
   function renderSettings() {
     if (view !== 'settings') return;
     const s = S.settings;
     $('#batchApi').checked = !!s.batch_api;
+    $('#smartMemory').checked = !!s.smart_memory;
     const b = $('#budget');
     if (document.activeElement !== b) b.value = s.budget_usd || '';
     for (const [id, key, lab, def] of ADV) {
@@ -737,12 +744,13 @@
     if (!p.translated) actions.append(h('button', { class: 'btn', disabled: busy, title: 'Translate the first 150 lines of one script and install them, to check the result in the game before paying for all of it.', onclick: () => run('test') }, 'Try 150 lines first'));
     if (p.installed) actions.append(h('button', { class: 'btn', onclick: launch }, 'Launch the game'));
     if (p.installed) actions.append(h('button', { class: 'btn btn-quiet danger', disabled: busy, onclick: () => run('restore') }, 'Remove the patch'));
+    if (p.built_at || p.installed || p.manual_output) actions.append(h('button', { class: 'btn btn-quiet', disabled: busy, onclick: exportZip, title: 'The built patch as one .zip with install instructions.' }, 'Export patch (.zip)'));
     card.append(actions);
     card.append(h('p', { class: 'hint', text: p.installed
       ? 'The patch is installed. Removing it puts the original game files back.'
       : 'Yakusu saves as it goes: stop at any time and continue later. It only changes the game when it installs the patch, and that can be undone.' }));
     card.append(h('details', { class: 'advanced' }, h('summary', { text: 'Run one stage at a time' }),
-      h('div', { class: 'row-actions' }, [['translate', 'Translate'], ['review', 'Review'], ['fit', 'Shorten overflowing lines'], ['glossary', 'Fix name spellings'], ['build', 'Rebuild and install']]
+      h('div', { class: 'row-actions' }, [['translate', 'Translate'], ['review', 'Review'], ['fit', 'Shorten overflowing lines'], ['glossary', 'Fix name spellings'], ['subtext', 'Subtext QA'], ['build', 'Rebuild and install']]
         .map(([a, t]) => h('button', { class: 'btn', onclick: () => run(a) }, t)))));
     box.replaceChildren(card);
     const mn = $('#manualNote');
@@ -818,6 +826,7 @@
     for (const sp of speakers) if (!names.find(([j]) => j === sp)) names.push([sp, '']);
     $('#namesBody').replaceChildren(...names.map(([j, e]) => pairRow(j, e)));
     $('#termsBody').replaceChildren(...(((r.glossary && r.glossary.terms) || []).map((t) => pairRow(t.jp, t.en))));
+    $('#charsBody').replaceChildren(...(((r.glossary && r.glossary.characters) || []).map(charRow)));
     $('#draftStyle').textContent = S.project.has_style ? 'Draft again from the script' : 'Draft now';
     $('#draftStyle').className = S.project.has_style ? 'btn' : 'btn btn-primary';
     $('#styleHint').textContent = S.project.has_style ? 'Drafting again replaces the style sheet and adds new names. Names you set are kept.' : 'Costs a few cents. Translating does this by itself if you skip it.';
@@ -826,6 +835,16 @@
     return h('tr', null, h('td', null, h('input', { value: j || '', 'aria-label': 'Japanese', lang: 'ja' })),
       h('td', null, h('input', { value: e || '', 'aria-label': 'English', placeholder: 'Not set yet' })));
   }
+  // "大雅=Taiga-kun; 桜=Sakura" <-> {"大雅": "Taiga-kun", "桜": "Sakura"}
+  const rulesText = (o) => Object.entries(o || {}).map(([k, v]) => `${k}=${v}`).join('; ');
+  const rulesObj = (t) => Object.fromEntries(t.split(/[;\n]/).map((x) => x.split('=')).filter((x) => x.length >= 2)
+    .map(([k, ...v]) => [k.trim(), v.join('=').trim()]).filter(([k, v]) => k && v));
+  function charRow(c) {
+    const cell = (v, label, extra) => h('td', null, h('input', { value: v || '', 'aria-label': label, ...(extra || {}) }));
+    return h('tr', null, cell(c.jp, 'Japanese', { lang: 'ja' }), cell(c.en, 'English'), cell(c.pronouns, 'Pronouns', { placeholder: 'she/her' }),
+      cell(c.voice, 'Voice', { placeholder: 'Teasing, casual' }), cell(rulesText(c.address_rules), 'Calls', { placeholder: '大雅=Taiga-kun' }));
+  }
+  $('#addChar').addEventListener('click', () => { const r = charRow({}); $('#charsBody').append(r); $('input', r).focus(); });
   $('#addName').addEventListener('click', () => { const r = pairRow('', ''); $('#namesBody').append(r); $('input', r).focus(); });
   $('#addTerm').addEventListener('click', () => { const r = pairRow('', ''); $('#termsBody').append(r); $('input', r).focus(); });
   $('#draftStyle').addEventListener('click', () => {
@@ -841,7 +860,9 @@
       const names = {};
       for (const [j, e] of pairs($('#namesBody'))) names[j] = e;
       const terms = pairs($('#termsBody')).map(([jp, en]) => ({ jp, en }));
-      await call('save_style', { style: $('#styleText').value, glossary: { names, terms } });
+      const characters = $$('tr', $('#charsBody')).map((tr) => $$('input', tr).map((i) => i.value.trim())).filter(([j]) => j)
+        .map(([jp, en, pronouns, voice, calls]) => ({ jp, en, pronouns, voice, address_rules: rulesObj(calls) }));
+      await call('save_style', { style: $('#styleText').value, glossary: { names, terms, characters } });
       $('#styleSaved').textContent = 'Saved. Every batch from now on follows these notes.';
     }), 700);
   }
@@ -867,6 +888,8 @@
     const st = p.settings || {};
     if (document.activeElement !== $('#quotes')) $('#quotes').value = st.quotes || 'auto';
     $('#insertBreaks').checked = st.insert_breaks !== false;
+    $('#proportionalFont').checked = !!box.proportional;
+    $('#bilingualMode').checked = !!st.bilingual;
     $('#boxHint').textContent = box.user_set ? 'Using your text box size.' :
       (box.mode === 'explicit' ? `Measured from the original script: lines of up to ${box.width} half-width characters, ${box.lines} lines per box.` :
         'This game wraps text itself. The width is an estimate; adjust it if words get split in the game.');
@@ -886,6 +909,15 @@
   }
   ['#boxWidth', '#boxLines'].forEach((id) => $(id).addEventListener('input', boxChanged));
   ['#quotes', '#insertBreaks'].forEach((id) => $(id).addEventListener('change', boxChanged));
+  $('#proportionalFont').addEventListener('change', (e) => safe(async () => { await call('box', { proportional: e.target.checked }); await refresh(); await loadPreview(); }));
+  $('#bilingualMode').addEventListener('change', (e) => safe(async () => { await call('box', { bilingual: e.target.checked }); await refresh(); await loadPreview(); }));
+  function exportZip() {
+    safe(async () => {
+      const r = await call('export_patch_zip');
+      toast(`Saved ${String(r.path).split(/[\\/]/).pop()} (${plural(r.files, 'file')}) in the project's exports folder.`);
+    });
+  }
+  $('#exportPatchZip').addEventListener('click', exportZip);
   $('#applyFit').addEventListener('click', () => run('refit'));
   $('#launch1').addEventListener('click', launch);
   $('#restore1').addEventListener('click', () => run('restore'));
@@ -1068,6 +1100,23 @@
         h('button', { class: 'mini', title: r.skip ? 'Translate this line' : 'Don\'t translate this line', 'aria-label': r.skip ? 'Translate this line' : 'Skip this line',
           onclick: () => safe(async () => { await call('line', { id: r.id, skip: !r.skip }); loadLines(); }) }, r.skip ? '↺' : '×')));
   }
+
+  // ------------------------------------------------------------ game doctor
+  let diagText = '';
+  async function runDoctor() {
+    await safe(async () => {
+      const d = await call('diagnose');
+      diagText = d.text || '';
+      $('#diagBox').textContent = diagText;
+      $('#diagBox').hidden = false;
+      $('#copyDiag').hidden = false;
+    });
+  }
+  $('#runDoctor').addEventListener('click', runDoctor);
+  $('#copyDiag').addEventListener('click', () => safe(async () => {
+    await navigator.clipboard.writeText(diagText);
+    toast('Diagnostics copied.');
+  }));
 
   // ------------------------------------------------------------ log
   function renderLog() {

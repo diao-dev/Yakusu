@@ -505,6 +505,10 @@ table.names input:placeholder-shown { border-color: var(--warn-bg); box-shadow: 
 .lint p { margin: 8px 0 0; color: var(--ink-3); }
 .lint-links { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .callout-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.log.diag { margin-bottom: 14px; max-height: 340px; }
+.names.chars { width: 100%; }
+.names.chars td:nth-child(4) { width: 34%; }
+.names.chars td:nth-child(5) { width: 22%; }
 .mini { width: 30px; height: 30px; border-radius: 8px; border: 0; background: none; cursor: pointer; color: var(--ink-3); font-size: 16px; }
 .mini:hover { background: var(--hover); color: var(--ink); }
 .pager { display: flex; align-items: center; gap: 12px; margin-top: 16px; color: var(--ink-3); font-size: 14px; }
@@ -580,3 +584,4 @@ table.names input:placeholder-shown { border-color: var(--warn-bg); box-shadow: 
   .job-fill.indeterminate { animation: none; width: 100%; opacity: .5; }
   .bar i, .job-fill { transition: none; }
 }
+table.names.chars input:placeholder-shown { border-color: var(--rule); box-shadow: none; }
