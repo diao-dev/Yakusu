@@ -125,7 +125,8 @@ fn generic_skips_media_archives_and_survives_empty_sibling() {
     let mut hits = generic::glob(&g, &["GameData/*.pack"]);
     hits.sort();
     if cfg!(windows) {
-        assert_eq!(hits.len(), 1);
+        // One folder there (names aren't case-sensitive): both files are in it.
+        assert_eq!(hits.len(), 2, "{hits:?}");
     } else {
         assert_eq!(hits, vec!["GameData/a.pack".to_string(), "gamedata/b.pack".to_string()]);
     }
