@@ -37,7 +37,12 @@ fn mock() -> Mock {
                     q.remove(0)
                 }
             };
-            let mut resp = tiny_http::Response::from_string(body.to_string()).with_status_code(status);
+            // A JSON string is sent as raw text (for JSONL replies).
+            let text = match &body {
+                Value::String(s) => s.clone(),
+                v => v.to_string(),
+            };
+            let mut resp = tiny_http::Response::from_string(text).with_status_code(status);
             for (k, v) in hdrs {
                 resp.add_header(tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap());
             }
@@ -367,4 +372,132 @@ fn gemini_requests() {
     drop(reqs);
     m.queue.lock().unwrap().push((200, json!({"data": [{"id": "models/gemini-3.8-flash"}]}), vec![]));
     assert_eq!(llm::list_models("gemini", "k", Some(&format!("{}/v1", m.url))).unwrap(), ["gemini-3.8-flash"]);
+}
+
+fn batch_req(key: &str) -> llm::BatchRequest {
+    llm::BatchRequest { key: key.into(), system: "SYS".into(), user: format!("USER {key}"), max_tokens: 500 }
+}
+
+#[test]
+fn claude_batch_round_trip() {
+    let m = mock();
+    let c = client(&m, "anthropic", "claude-haiku-5-5");
+    assert!(c.batch_supported());
+    let results_url = format!("{}/v1/messages/batches/b1/results", m.url);
+    let msg = |t: &str, stop: &str| {
+        json!({"type": "message", "content": [{"type": "text", "text": t}], "stop_reason": stop,
+               "usage": {"input_tokens": 10, "output_tokens": 5}})
+    };
+    let jsonl = [
+        json!({"custom_id": "k1", "result": {"type": "succeeded", "message": msg("[1]", "end_turn")}}),
+        json!({"custom_id": "k2", "result": {"type": "succeeded", "message": msg("[2", "max_tokens")}}),
+        json!({"custom_id": "k3", "result": {"type": "errored", "error": {"type": "error",
+               "error": {"type": "invalid_request_error", "message": "bad thing"}}}}),
+        json!({"custom_id": "k4", "result": {"type": "expired"}}),
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    m.queue.lock().unwrap().extend([
+        (200, json!({"id": "b1", "processing_status": "in_progress"}), vec![]),
+        (
+            200,
+            json!({"id": "b1", "processing_status": "in_progress",
+                     "request_counts": {"processing": 3, "succeeded": 1, "errored": 0, "canceled": 0, "expired": 0}}),
+            vec![],
+        ),
+        (503, json!({"error": {"message": "busy"}}), vec![]),
+        (
+            200,
+            json!({"id": "b1", "processing_status": "ended", "results_url": results_url,
+                     "request_counts": {"processing": 0, "succeeded": 2, "errored": 1, "canceled": 0, "expired": 1}}),
+            vec![],
+        ),
+        (200, json!({"id": "b1", "processing_status": "ended", "results_url": results_url}), vec![]),
+        (200, Value::String(jsonl), vec![]),
+    ]);
+    let no = AtomicBool::new(false);
+    let reqs = vec![batch_req("k1"), batch_req("k2"), batch_req("k3"), batch_req("k4")];
+    assert_eq!(c.batch_submit(&reqs, &no).unwrap(), "b1");
+    let st = c.batch_status("b1", &no).unwrap();
+    assert_eq!((st.done, st.finished), (false, 1));
+    // A server error while checking is retried.
+    let st = c.batch_status("b1", &no).unwrap();
+    assert_eq!((st.done, st.finished, st.failed), (true, 4, None));
+    let got = c.batch_results("b1", &[], &no).unwrap();
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[0].0, "k1");
+    let (text, u) = got[0].1.as_ref().unwrap();
+    assert_eq!((text.as_str(), u.input, u.output), ("[1]", 10, 5));
+    assert!(matches!(got[1].1, Err(LlmError::Truncated(_))));
+    assert!(matches!(&got[2].1, Err(LlmError::Fatal(m)) if m == "bad thing"));
+    assert!(matches!(got[3].1, Err(LlmError::Fatal(_))));
+    let reqs = m.requests.lock().unwrap();
+    // Same request a live call sends, under the caller's key.
+    let r = &reqs[0].1["requests"][0];
+    assert_eq!(r["custom_id"], "k1");
+    assert_eq!(r["params"]["model"], "claude-haiku-5-5");
+    assert_eq!(r["params"]["thinking"]["type"], "disabled");
+    assert_eq!(r["params"]["messages"][0]["content"], "USER k1");
+    assert_eq!(header(&reqs[0].0, "x-api-key"), Some("key-123"));
+    assert_eq!(header(&reqs[5].0, "x-api-key"), Some("key-123"));
+}
+
+#[test]
+fn gemini_batch_round_trip() {
+    let m = mock();
+    // Gemini is reached through its OpenAI-compatible address; batches go native.
+    let c = Client::new("gemini", "g-key", "gemini-3.1-flash-lite", Some(&format!("{}/v1beta/openai", m.url)));
+    assert!(c.batch_supported());
+    let other = Client::new("gemini", "g-key", "gemini-3.1-flash-lite", Some(&format!("{}/v1", m.url)));
+    assert!(!other.batch_supported());
+    let answer = |t: &str, finish: &str| {
+        json!({"candidates": [{"content": {"parts": [{"text": "hmm", "thought": true}, {"text": t}]},
+                                "finishReason": finish}],
+               "usageMetadata": {"promptTokenCount": 30, "candidatesTokenCount": 7, "thoughtsTokenCount": 3}})
+    };
+    m.queue.lock().unwrap().extend([
+        (200, json!({"name": "batches/abc", "metadata": {"state": "BATCH_STATE_PENDING"}}), vec![]),
+        (
+            200,
+            json!({"name": "batches/abc", "metadata": {"state": "BATCH_STATE_RUNNING",
+                     "batchStats": {"requestCount": "3", "successfulRequestCount": "1"}}}),
+            vec![],
+        ),
+        (200, json!({"name": "batches/abc", "done": true, "metadata": {"state": "BATCH_STATE_SUCCEEDED"}}), vec![]),
+        (
+            200,
+            json!({"name": "batches/abc", "done": true, "metadata": {"state": "BATCH_STATE_SUCCEEDED"},
+            "response": {"inlinedResponses": {"inlinedResponses": [
+               {"response": answer("[A]", "STOP"), "metadata": {"key": "a"}},
+               {"response": answer("", "SAFETY")},
+               {"error": {"code": 3, "message": "nope"}},
+            ]}}}),
+            vec![],
+        ),
+        (200, json!({"name": "batches/x", "done": true, "metadata": {"state": "JOB_STATE_EXPIRED"}}), vec![]),
+    ]);
+    let no = AtomicBool::new(false);
+    let reqs = vec![batch_req("a"), batch_req("b"), batch_req("c")];
+    assert_eq!(c.batch_submit(&reqs, &no).unwrap(), "batches/abc");
+    assert_eq!(c.batch_status("batches/abc", &no).unwrap().finished, 1);
+    assert!(c.batch_status("batches/abc", &no).unwrap().done);
+    let keys: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    let got = c.batch_results("batches/abc", &keys, &no).unwrap();
+    assert_eq!(got.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+    let (text, u) = got[0].1.as_ref().unwrap();
+    assert_eq!((text.as_str(), u.input, u.output), ("[A]", 30, 10)); // thinking billed as output
+    assert!(matches!(got[1].1, Err(LlmError::Refused(_))));
+    assert!(matches!(&got[2].1, Err(LlmError::Fatal(m)) if m == "nope"));
+    let st = c.batch_status("batches/x", &no).unwrap();
+    assert!(st.done && st.failed.as_deref().unwrap().contains("expired"));
+    let reqs = m.requests.lock().unwrap();
+    assert_eq!(header(&reqs[0].0, "x-goog-api-key"), Some("g-key"));
+    let r = &reqs[0].1["batch"]["input_config"]["requests"]["requests"][1];
+    assert_eq!(r["metadata"]["key"], "b");
+    assert_eq!(r["request"]["contents"][0]["parts"][0]["text"], "USER b");
+    assert_eq!(r["request"]["systemInstruction"]["parts"][0]["text"], "SYS");
+    assert_eq!(r["request"]["generationConfig"]["maxOutputTokens"], 5000);
+    assert_eq!(r["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
 }

@@ -600,9 +600,15 @@
     $(id).addEventListener('input', () => { $(lab).textContent = $(id).value; });
     $(id).addEventListener('change', () => safe(async () => { await call('settings', { [key]: +$(id).value }); estimates = null; loadEstimates(); }));
   }
+  $('#batchApi').addEventListener('change', (e) => safe(async () => {
+    await call('settings', { batch_api: e.target.checked });
+    toast(e.target.checked ? 'Batch API on: half price, answers within 24 hours.' : 'Batch API off.');
+    estimates = null; loadEstimates();
+  }));
   function renderSettings() {
     if (view !== 'settings') return;
     const s = S.settings;
+    $('#batchApi').checked = !!s.batch_api;
     const b = $('#budget');
     if (document.activeElement !== b) b.value = s.budget_usd || '';
     for (const [id, key, lab, def] of ADV) {
@@ -711,6 +717,8 @@
       allDone ? 'Every line is translated. ' : p.translated ? [h('b', { text: num(remaining) }), remaining === 1 ? ' line left. ' : ' lines left. '] : null,
       costLeft ? [allDone ? 'Finishing the review should cost ' : p.translated ? 'The rest should cost ' : 'Translating the whole game should cost ', h('b', { text: costLeft }), '. '] :
         (!allDone && s.provider === 'local' ? 'A local model costs nothing. ' : null),
+      costLeft && est.batch ? 'That\'s at Batch API prices (half); answers can take up to 24 hours. ' : null,
+      est && est.batch_waiting ? [h('b', { text: num(est.batch_waiting) }), ' requests are waiting at the Batch API; ', busy ? 'Yakusu is collecting them. ' : 'press the button below to collect them. '] : null,
       p.spent > 0 ? ['Spent so far: ', h('b', { text: money(p.spent) }), '. '] : null,
       p.problems ? [h('a', { href: '#', onclick: (e) => { e.preventDefault(); linesState.filter = 'problems'; show('lines'); } }, `${plural(p.problems, 'line')} need a look`), '.'] : null));
     const main = h('button', { class: 'btn btn-primary btn-lg', id: 'runAuto', disabled: busy, onclick: () => run('auto') },

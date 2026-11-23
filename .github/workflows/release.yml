@@ -5,6 +5,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Attach Yakusu.exe to this existing release (for example v0.4.2). Leave empty to just build the file.
+        required: false
+        default: ''
 jobs:
   windows:
     runs-on: windows-latest
@@ -18,7 +23,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test -p yakusu-core 2>&1 | tee test.log || {
+          cargo test -p yakusu-core --no-fail-fast 2>&1 | tee test.log || {
             grep -E "panicked at|^test .* FAILED|^error|left:|right:|Err\(" test.log | head -40 | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           }
@@ -32,8 +37,9 @@ jobs:
         with:
           name: Yakusu
           path: target/release/Yakusu.exe
-      - if: github.event_name == 'release'
+      - if: github.event_name == 'release' || inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: target/release/Yakusu.exe
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
