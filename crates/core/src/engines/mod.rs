@@ -362,10 +362,78 @@ pub fn write_json_messages(path: &Path, entries: &[Entry]) -> Result<()> {
 
 pub fn clean_dir(path: &Path) -> Result<()> {
     if path.is_dir() {
-        fs::remove_dir_all(path)?;
+        remove_dir_force(path)?;
     }
     fs::create_dir_all(path)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------- Windows file quirks
+
+/// Clear the read-only flag on `path` and, for a folder, everything in it.
+/// Games copied from a disc image or an old archive often have it set, and
+/// Windows then refuses to delete or replace those files. Links are never
+/// followed. Does nothing on other systems, where the flag doesn't block that.
+pub fn clear_readonly(path: &Path) {
+    #[cfg(windows)]
+    {
+        let Ok(meta) = fs::symlink_metadata(path) else { return };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        let mut perm = meta.permissions();
+        if perm.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            let _ = fs::set_permissions(path, perm);
+        }
+        if meta.is_dir() {
+            if let Ok(rd) = fs::read_dir(path) {
+                for e in rd.flatten() {
+                    clear_readonly(&e.path());
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
+/// How often a short-lived lock (antivirus scan, search indexer) is waited out.
+const LOCK_RETRIES: u32 = 6;
+
+/// `fs::rename`, waiting out a brief lock and replacing a read-only target.
+pub fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        if fs::symlink_metadata(to).is_ok_and(|m| m.is_file()) {
+            clear_readonly(to);
+        }
+        match fs::rename(from, to) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < LOCK_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(40 * attempt as u64));
+            }
+            r => return r,
+        }
+    }
+}
+
+/// `fs::remove_dir_all` that also removes read-only files and waits out a
+/// brief lock. A folder that is already gone counts as removed.
+pub fn remove_dir_force(path: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        clear_readonly(path);
+        match fs::remove_dir_all(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < LOCK_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+            }
+            r => return r,
+        }
+    }
 }
 
 /// Recursively copy `src` into `dst` (merging, overwriting files).
@@ -491,7 +559,7 @@ pub fn atomic_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     let (tmp, mut out) = create_temp(dst)?;
     let r = std::io::copy(&mut input, &mut out).and_then(|_| out.sync_all());
     drop(out);
-    let r = r.and_then(|_| fs::rename(&tmp, dst));
+    let r = r.and_then(|_| rename_retry(&tmp, dst));
     if r.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -675,6 +743,7 @@ impl Installer {
         for rel in self.manifest.added.clone() {
             let p = safe_join(game, &rel)?;
             if p.exists() {
+                clear_readonly(&p);
                 fs::remove_file(&p).map_err(denied)?;
                 log(&format!("Removed {rel}"));
             }

@@ -59,7 +59,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         id: "artemis",
         name: "Artemis",
-        archives: &["*.pfs", "*.pfs.*"],
+        archives: &["*.pfs", "*.pfs.*", "data/*.pfs"],
         archive_type: Some("artemis-arc"),
         encoding: "utf-8",
         ..P
@@ -73,7 +73,13 @@ pub const PROFILES: &[Profile] = &[
         script_type: Some("bgi"),
         ..P
     },
-    Profile { id: "yuris", name: "YU-RIS", archives: &["*.ypf"], archive_type: Some("yuris-ypf"), ..P },
+    Profile {
+        id: "yuris",
+        name: "YU-RIS",
+        archives: &["*.ypf", "pac/*.ypf", "data/*.ypf"],
+        archive_type: Some("yuris-ypf"),
+        ..P
+    },
     Profile {
         id: "qlie",
         name: "QLiE",
@@ -184,37 +190,52 @@ fn entries(dir: &Path) -> Vec<(String, bool)> {
     v
 }
 
-/// Files in the game matching any pattern ("GameData/*.pack" walks one folder level).
+/// Files in the game matching any pattern ("GameData/*.pack" walks one
+/// folder level; every folder matching a part is searched, not just the first).
 pub fn glob(game_dir: &Path, patterns: &[&str]) -> Vec<String> {
     let mut hits = std::collections::BTreeSet::new();
     for pat in patterns {
         let parts: Vec<&str> = pat.split('/').collect();
-        let mut base = game_dir.to_path_buf();
-        let mut prefix = String::new();
-        let mut ok = true;
+        // (folder, its '/'-terminated path from the game folder)
+        let mut bases = vec![(game_dir.to_path_buf(), String::new())];
         for part in &parts[..parts.len() - 1] {
-            match entries(&base).into_iter().find(|(n, d)| *d && fnmatch(n, part)) {
-                Some((n, _)) => {
-                    base.push(&n);
-                    prefix.push_str(&n);
-                    prefix.push('/');
-                }
-                None => {
-                    ok = false;
-                    break;
+            let mut next = Vec::new();
+            for (base, prefix) in &bases {
+                for (n, is_dir) in entries(base) {
+                    if is_dir && fnmatch(&n, part) {
+                        next.push((base.join(&n), format!("{prefix}{n}/")));
+                    }
                 }
             }
+            bases = next;
         }
-        if !ok {
-            continue;
-        }
-        for (n, is_dir) in entries(&base) {
-            if !is_dir && fnmatch(&n, parts[parts.len() - 1]) {
-                hits.insert(format!("{prefix}{n}"));
+        for (base, prefix) in &bases {
+            for (n, is_dir) in entries(base) {
+                if !is_dir && fnmatch(&n, parts[parts.len() - 1]) {
+                    hits.insert(format!("{prefix}{n}"));
+                }
             }
         }
     }
     hits.into_iter().collect()
+}
+
+/// An archive whose name says it only holds media (voices, music, CGs,
+/// sprites, movies): "voice.pfs", "bgm01.ypf", "cg_a.pack", "data/se.arc".
+pub fn looks_like_media_archive(rel: &str) -> bool {
+    const MEDIA: &[&str] = &[
+        "voice", "vo", "bgm", "se", "sound", "sysse", "movie", "video", "cg", "ev", "bg", "fg", "stand", "chara",
+        "face", "image", "img", "thumb", "graphic",
+    ];
+    let base = rel.rsplit(['/', '\\']).next().unwrap_or(rel).to_lowercase();
+    MEDIA.iter().any(|m| {
+        base.strip_prefix(m).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with(['.', '_', '-'])
+                || rest.starts_with(|c: char| c.is_ascii_digit())
+                || (*m == "graphic" && rest.starts_with('s'))
+        })
+    })
 }
 
 pub fn detect_profile(game_dir: &Path, prof: &Profile) -> Option<Match> {
@@ -467,7 +488,17 @@ impl Engine for MsgToolEngine {
         // While a patch is installed the game's file is our English: read the
         // original from its backup instead.
         let inst = Installer::new(cx.project);
+        // A game with many archives keeps its voices and pictures apart from
+        // the script: unpacking those costs time and finds no text. Skip them
+        // when something else could hold the script.
+        let several = files.len() > 1;
+        let any_other = files.iter().any(|f| !looks_like_media_archive(f));
+        let mut last_err = None;
         for rel in files {
+            if several && any_other && prof.archive_type.is_some() && looks_like_media_archive(&rel) {
+                cx.log(format!("Skipping {rel} (media archive)"));
+                continue;
+            }
             let path = inst.original(&game, &rel)?;
             if path != join_rel(&game, &rel) {
                 cx.log(format!("{rel} is patched: reading the original from the backup"));
@@ -483,19 +514,35 @@ impl Engine for MsgToolEngine {
                     None => cx.log(format!("{rel}: couldn't read the YU-RIS archive version; it may not rebuild.")),
                 }
             }
-            if let Some(at) = prof.archive_type {
-                cx.log(format!("Unpacking {rel}"));
-                msgtool::unpack(cx, &path, &dst, Some(at), &[])?;
-            } else {
-                fs::create_dir_all(&dst)?;
-                fs::copy(&path, dst.join(path.file_name().unwrap()))?;
+            let read = |dst: &Path| -> Result<()> {
+                if let Some(at) = prof.archive_type {
+                    cx.log(format!("Unpacking {rel}"));
+                    msgtool::unpack(cx, &path, dst, Some(at), &[])?;
+                } else {
+                    fs::create_dir_all(dst)?;
+                    fs::copy(&path, dst.join(path.file_name().unwrap()))?;
+                }
+                msgtool::export(cx, dst, &json_root.join(&key), prof.script_type)
+            };
+            if let Err(e) = read(&dst) {
+                if !several {
+                    return Err(e);
+                }
+                // One bad archive among several: read the rest. If none of
+                // them has text, this error is the one reported.
+                let _ = super::remove_dir_force(&dst);
+                let _ = super::remove_dir_force(&json_root.join(&key));
+                cx.log(format!("Warning: couldn't read {rel}, so it's left out ({e})."));
+                last_err = Some(e);
             }
-            msgtool::export(cx, &dst, &json_root.join(&key), prof.script_type)?;
         }
         if prof.id == "yuris" {
             self.m.set("ypf_versions", Value::Object(versions));
         }
         if list_files(&json_root, Some(&[".json"])).is_empty() {
+            if let Some(e) = last_err {
+                return Err(e);
+            }
             return user(format!(
                 "No text was found in the {} scripts. The game may use a variant msg-tool doesn't read yet.",
                 prof.name

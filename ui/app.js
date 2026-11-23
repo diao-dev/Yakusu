@@ -165,7 +165,8 @@
 
   const DONE_MSG = { extract: 'Scripts read.', style: 'Style sheet drafted.', refit: 'Applied to the game.',
     restore: 'Original game restored.', build: 'Patch rebuilt and installed.', glossary: 'Name spellings fixed.',
-    retranslate: 'Lines retranslated.', translate: 'Translation saved.', review: 'Review finished.', fit: 'Long lines shortened.' };
+    retranslate: 'Lines retranslated.', translate: 'Translation saved.', review: 'Review finished.', fit: 'Long lines shortened.',
+    subtext: 'Subtext check finished. Suggestions are under Subtext QA.' };
   function onJobDone() {
     const j = S.job;
     if (j.need) needSetup(j.need, j.error);
@@ -219,11 +220,13 @@
     renderSettings();
     renderTest();
     if (view === 'activity') renderLog();
+    if (view === 'lines') loadLines();
   }
 
   const STAGE = { extract: 'Reading the scripts', style: 'Writing the style sheet', translate: 'Translating', review: 'Reviewing',
     fit: 'Fitting text to the box', build: 'Building the patch', test: 'Test patch', auto: 'Getting ready', refit: 'Building the patch',
-    restore: 'Restoring', glossary: 'Checking name spellings', names: 'Naming the characters', retranslate: 'Retranslating' };
+    restore: 'Restoring', glossary: 'Checking name spellings', names: 'Naming the characters', retranslate: 'Retranslating',
+    subtext: 'Checking subtext' };
   function renderJob() {
     const j = S.job || {};
     $('#jobbar').hidden = !j.running;
@@ -262,7 +265,7 @@
 
   // A failed job leaves a banner until dismissed, with a way to try again.
   let bannerDismissed = null;
-  const RETRYABLE = ['extract', 'style', 'test', 'refit', 'auto', 'translate', 'review', 'fit', 'build', 'restore', 'glossary'];
+  const RETRYABLE = ['extract', 'style', 'test', 'refit', 'auto', 'translate', 'review', 'fit', 'build', 'restore', 'glossary', 'subtext'];
   function renderBanner() {
     const j = S.job || {};
     // The game's own card explains a failed read; setup problems open their control.
@@ -420,7 +423,15 @@
     if (reading) {
       card.append(h('p', { class: 'note reading', role: 'status', text: 'Reading the scripts… this takes a moment for big games.' }));
     } else if (readError && !needTitle) {
-      card.append(h('div', { class: 'callout bad' }, h('b', { text: 'Couldn\'t read the scripts. ' }), readError));
+      card.append(h('div', { class: 'callout bad' }, h('b', { text: 'Couldn\'t read the scripts. ' }), readError,
+        h('div', { class: 'callout-actions' },
+          h('button', { class: 'btn btn-quiet', onclick: () => { show('activity'); runDoctor(); } }, 'Run Game Doctor'),
+          h('button', { class: 'btn btn-quiet', onclick: () => show('activity') }, 'View Activity log'),
+          h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
+            const logs = (S.logs || []).slice(-40).map((l) => l.m).join('\n');
+            await navigator.clipboard.writeText(`${readError}\n\n${p.game_dir}\n${logs}`);
+            toast('Error copied, with the recent Activity log.');
+          }) }, 'Copy error'))));
     }
     if (p.stats && !reading) {
       const st = p.stats;
@@ -605,10 +616,16 @@
     toast(e.target.checked ? 'Batch API on: half price, answers within 24 hours.' : 'Batch API off.');
     estimates = null; loadEstimates();
   }));
+  $('#smartMemory').addEventListener('change', (e) => safe(async () => {
+    await call('settings', { smart_memory: e.target.checked });
+    toast(e.target.checked ? 'Short lines will be translated in their scene.' : 'Repeated short lines will reuse one translation.');
+    estimates = null; loadEstimates();
+  }));
   function renderSettings() {
     if (view !== 'settings') return;
     const s = S.settings;
     $('#batchApi').checked = !!s.batch_api;
+    $('#smartMemory').checked = !!s.smart_memory;
     const b = $('#budget');
     if (document.activeElement !== b) b.value = s.budget_usd || '';
     for (const [id, key, lab, def] of ADV) {
@@ -727,12 +744,13 @@
     if (!p.translated) actions.append(h('button', { class: 'btn', disabled: busy, title: 'Translate the first 150 lines of one script and install them, to check the result in the game before paying for all of it.', onclick: () => run('test') }, 'Try 150 lines first'));
     if (p.installed) actions.append(h('button', { class: 'btn', onclick: launch }, 'Launch the game'));
     if (p.installed) actions.append(h('button', { class: 'btn btn-quiet danger', disabled: busy, onclick: () => run('restore') }, 'Remove the patch'));
+    if (p.built_at || p.installed || p.manual_output) actions.append(h('button', { class: 'btn btn-quiet', disabled: busy, onclick: exportZip, title: 'The built patch as one .zip with install instructions.' }, 'Export patch (.zip)'));
     card.append(actions);
     card.append(h('p', { class: 'hint', text: p.installed
       ? 'The patch is installed. Removing it puts the original game files back.'
       : 'Yakusu saves as it goes: stop at any time and continue later. It only changes the game when it installs the patch, and that can be undone.' }));
     card.append(h('details', { class: 'advanced' }, h('summary', { text: 'Run one stage at a time' }),
-      h('div', { class: 'row-actions' }, [['translate', 'Translate'], ['review', 'Review'], ['fit', 'Shorten overflowing lines'], ['glossary', 'Fix name spellings'], ['build', 'Rebuild and install']]
+      h('div', { class: 'row-actions' }, [['translate', 'Translate'], ['review', 'Review'], ['fit', 'Shorten overflowing lines'], ['glossary', 'Fix name spellings'], ['subtext', 'Subtext QA'], ['build', 'Rebuild and install']]
         .map(([a, t]) => h('button', { class: 'btn', onclick: () => run(a) }, t)))));
     box.replaceChildren(card);
     const mn = $('#manualNote');
@@ -768,7 +786,7 @@
   }
 
   function launch() { safe(async () => { const r = await call('launch'); toast(`Started ${r.launched}.`); }); }
-  const NEEDS_MODEL = ['auto', 'test', 'style', 'translate', 'review', 'fit', 'glossary'];
+  const NEEDS_MODEL = ['auto', 'test', 'style', 'translate', 'review', 'fit', 'glossary', 'subtext'];
   function run(action) {
     safe(async () => {
       if (!S.project) throw new Error('Choose a game folder first.');
@@ -808,6 +826,7 @@
     for (const sp of speakers) if (!names.find(([j]) => j === sp)) names.push([sp, '']);
     $('#namesBody').replaceChildren(...names.map(([j, e]) => pairRow(j, e)));
     $('#termsBody').replaceChildren(...(((r.glossary && r.glossary.terms) || []).map((t) => pairRow(t.jp, t.en))));
+    $('#charsBody').replaceChildren(...(((r.glossary && r.glossary.characters) || []).map(charRow)));
     $('#draftStyle').textContent = S.project.has_style ? 'Draft again from the script' : 'Draft now';
     $('#draftStyle').className = S.project.has_style ? 'btn' : 'btn btn-primary';
     $('#styleHint').textContent = S.project.has_style ? 'Drafting again replaces the style sheet and adds new names. Names you set are kept.' : 'Costs a few cents. Translating does this by itself if you skip it.';
@@ -816,6 +835,16 @@
     return h('tr', null, h('td', null, h('input', { value: j || '', 'aria-label': 'Japanese', lang: 'ja' })),
       h('td', null, h('input', { value: e || '', 'aria-label': 'English', placeholder: 'Not set yet' })));
   }
+  // "大雅=Taiga-kun; 桜=Sakura" <-> {"大雅": "Taiga-kun", "桜": "Sakura"}
+  const rulesText = (o) => Object.entries(o || {}).map(([k, v]) => `${k}=${v}`).join('; ');
+  const rulesObj = (t) => Object.fromEntries(t.split(/[;\n]/).map((x) => x.split('=')).filter((x) => x.length >= 2)
+    .map(([k, ...v]) => [k.trim(), v.join('=').trim()]).filter(([k, v]) => k && v));
+  function charRow(c) {
+    const cell = (v, label, extra) => h('td', null, h('input', { value: v || '', 'aria-label': label, ...(extra || {}) }));
+    return h('tr', null, cell(c.jp, 'Japanese', { lang: 'ja' }), cell(c.en, 'English'), cell(c.pronouns, 'Pronouns', { placeholder: 'she/her' }),
+      cell(c.voice, 'Voice', { placeholder: 'Teasing, casual' }), cell(rulesText(c.address_rules), 'Calls', { placeholder: '大雅=Taiga-kun' }));
+  }
+  $('#addChar').addEventListener('click', () => { const r = charRow({}); $('#charsBody').append(r); $('input', r).focus(); });
   $('#addName').addEventListener('click', () => { const r = pairRow('', ''); $('#namesBody').append(r); $('input', r).focus(); });
   $('#addTerm').addEventListener('click', () => { const r = pairRow('', ''); $('#termsBody').append(r); $('input', r).focus(); });
   $('#draftStyle').addEventListener('click', () => {
@@ -831,7 +860,9 @@
       const names = {};
       for (const [j, e] of pairs($('#namesBody'))) names[j] = e;
       const terms = pairs($('#termsBody')).map(([jp, en]) => ({ jp, en }));
-      await call('save_style', { style: $('#styleText').value, glossary: { names, terms } });
+      const characters = $$('tr', $('#charsBody')).map((tr) => $$('input', tr).map((i) => i.value.trim())).filter(([j]) => j)
+        .map(([jp, en, pronouns, voice, calls]) => ({ jp, en, pronouns, voice, address_rules: rulesObj(calls) }));
+      await call('save_style', { style: $('#styleText').value, glossary: { names, terms, characters } });
       $('#styleSaved').textContent = 'Saved. Every batch from now on follows these notes.';
     }), 700);
   }
@@ -857,6 +888,8 @@
     const st = p.settings || {};
     if (document.activeElement !== $('#quotes')) $('#quotes').value = st.quotes || 'auto';
     $('#insertBreaks').checked = st.insert_breaks !== false;
+    $('#proportionalFont').checked = !!box.proportional;
+    $('#bilingualMode').checked = !!st.bilingual;
     $('#boxHint').textContent = box.user_set ? 'Using your text box size.' :
       (box.mode === 'explicit' ? `Measured from the original script: lines of up to ${box.width} half-width characters, ${box.lines} lines per box.` :
         'This game wraps text itself. The width is an estimate; adjust it if words get split in the game.');
@@ -876,6 +909,15 @@
   }
   ['#boxWidth', '#boxLines'].forEach((id) => $(id).addEventListener('input', boxChanged));
   ['#quotes', '#insertBreaks'].forEach((id) => $(id).addEventListener('change', boxChanged));
+  $('#proportionalFont').addEventListener('change', (e) => safe(async () => { await call('box', { proportional: e.target.checked }); await refresh(); await loadPreview(); }));
+  $('#bilingualMode').addEventListener('change', (e) => safe(async () => { await call('box', { bilingual: e.target.checked }); await refresh(); await loadPreview(); }));
+  function exportZip() {
+    safe(async () => {
+      const r = await call('export_patch_zip');
+      toast(`Saved ${String(r.path).split(/[\\/]/).pop()} (${plural(r.files, 'file')}) in the project's exports folder.`);
+    });
+  }
+  $('#exportPatchZip').addEventListener('click', exportZip);
   $('#applyFit').addEventListener('click', () => run('refit'));
   $('#launch1').addEventListener('click', launch);
   $('#restore1').addEventListener('click', () => run('restore'));
@@ -944,17 +986,69 @@
     loadLines();
   }));
 
+  // Pre-repack check: free, offline, every line.
+  const LINT_KINDS = [['code_errors', 'broken codes'], ['japanese_left', 'Japanese left in'],
+    ['encoding_loss', 'characters the game can\'t show'], ['overflow', 'too long for the box'], ['glossary_issues', 'name spellings']];
+  $('#lintRun').addEventListener('click', () => safe(async () => {
+    const r = await call('lint');
+    const found = LINT_KINDS.filter(([k]) => r[k]);
+    const go = (f) => { linesState.filter = f; linesState.page = 0; loadLines(); };
+    const card = h('div', { class: 'lint ' + (found.length ? 'warn' : 'ok'), role: 'status' },
+      h('div', { class: 'lint-head' },
+        h('b', { text: found.length ? `${plural(r.translated - r.clean, 'line')} need a look before you rebuild` : `All ${num(r.translated)} translated lines look ready` }),
+        h('button', { class: 'mini', title: 'Dismiss', 'aria-label': 'Dismiss', onclick: () => $('#lintSummary').replaceChildren() }, '×')),
+      found.length ? h('ul', null, ...found.map(([k, label]) => h('li', null, h('b', { text: num(r[k]) }), ` ${label}`,
+        k === 'encoding_loss' ? ` (${r.encoding})` : null))) : null,
+      r.untranslated ? h('p', { text: `${plural(r.untranslated, 'line')} not translated yet.` }) : null,
+      h('div', { class: 'lint-links' },
+        h('button', { class: 'btn btn-quiet', onclick: () => go('problems') }, 'Problems'),
+        h('button', { class: 'btn btn-quiet', onclick: () => go('overflow') }, 'Overflow'),
+        r.subtext_flags ? h('button', { class: 'btn btn-quiet', onclick: () => go('subtext') }, `Subtext QA (${num(r.subtext_flags)})`) : null));
+    $('#lintSummary').replaceChildren(card);
+  }));
+  $('#subtextRun').addEventListener('click', () => run('subtext'));
+
+  // Reference translation shown beside each line.
+  $('#refFile').addEventListener('change', (e) => safe(async () => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    const r = await call('import_reference', { text: await f.text(), label: f.name });
+    toast(`Reference loaded for ${plural(r.matched, 'line')}` + (r.unmatched ? `; ${plural(r.unmatched, 'row')} didn't match this game` : '') + '.');
+    await refresh();
+    loadLines();
+  }));
+  $('#refClear').addEventListener('click', () => safe(async () => { await call('clear_reference'); await refresh(); loadLines(); }));
+  $('#refPrompt').addEventListener('change', (e) => safe(async () => {
+    await call('box', { use_reference_in_prompt: e.target.checked });
+    await refresh();
+  }));
+  function renderRefBar() {
+    const p = S && S.project;
+    const n = (p && p.reference_count) || 0;
+    $('#refStatus').textContent = n ? `${p.reference_label || 'Reference'}: ${plural(n, 'line')} matched` : '';
+    $('#refClear').hidden = !n;
+    $('#refPromptWrap').hidden = !n;
+    $('#refPrompt').checked = !!(p && p.settings && p.settings.use_reference_in_prompt !== false);
+    const c = $('#subtextCount');
+    const flags = (p && p.subtext_flags) || 0;
+    c.hidden = !flags;
+    c.textContent = num(flags);
+  }
+
   async function loadLines() {
     $$('#lineFilter button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.f === linesState.filter)));
-    $('#retranslatePage').hidden = !['problems', 'untranslated', 'reviewed'].includes(linesState.filter);
+    $('#retranslatePage').hidden = !['problems', 'untranslated', 'reviewed', 'overflow', 'subtext'].includes(linesState.filter);
     const list = $('#linesList');
     if (!S || !S.project || !S.project.extracted) {
       list.replaceChildren(h('div', { class: 'empty-state' }, svgUse('branch'), 'Open a game on the Translate page. Its lines will be listed here.'));
       $('#pager').replaceChildren();
       return;
     }
+    renderRefBar();
     const r = await call('lines', { filter: linesState.filter, q: linesState.q, page: linesState.page });
     lastRows = r.rows;
+    list.classList.toggle('has-ref', (S.project.reference_count || 0) > 0);
     const nr = r.rows.filter((x) => !x.skip).length;
     $('#retranslatePage').textContent = nr === 1 ? 'Retranslate this line' : `Retranslate these ${num(nr)} lines`;
     $('#retranslatePage').disabled = !nr;
@@ -965,6 +1059,7 @@
       h('span', { text: `Page ${r.page + 1} of ${pages}` }),
       h('button', { class: 'btn btn-quiet', disabled: r.page + 1 >= pages, onclick: () => { linesState.page++; loadLines(); } }, 'Next'));
   }
+  const list_has_ref = () => !!(S && S.project && S.project.reference_count);
   const STAGE_NAME = { translate: 'Translated', review: 'Improved in review', reviewed: 'Reviewed', fit: 'Shortened to fit', manual: 'Edited by you', cleared: 'Queued to translate again' };
   function lineRow(r) {
     const ta = h('textarea', { 'aria-label': 'English', placeholder: r.skip ? '' : 'Not translated yet' });
@@ -975,6 +1070,19 @@
     if (r.glossary && r.glossary.length) meta.append(h('span', { class: 'gloss', text: `Should use ${r.glossary.join(', ')}` }));
     if (r.skip) meta.append(h('span', { text: `Skipped: ${r.skip}` }));
     const before = r.before && r.before !== r.en ? h('div', { class: 'before', title: 'Before review', text: r.before }) : null;
+    const subtext = r.subtext_note ? h('div', { class: 'subtext-card' },
+      h('div', { class: 'note', text: r.subtext_note }),
+      h('div', { class: 'proposal', text: r.subtext_suggestion || '' }),
+      h('div', { class: 'subtext-actions' },
+        h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
+          await call('subtext_action', { id: r.id, accept: true });
+          toast('Suggestion used. Rebuild the patch to put it in the game.');
+          await refresh(); loadLines();
+        }) }, 'Accept'),
+        h('button', { class: 'btn btn-quiet', onclick: () => safe(async () => {
+          await call('subtext_action', { id: r.id, accept: false });
+          await refresh(); loadLines();
+        }) }, 'Dismiss'))) : null;
     ta.addEventListener('change', () => safe(async () => {
       const res = await call('line', { id: r.id, en: ta.value });
       meta.replaceChildren(res.problems && res.problems.length
@@ -984,13 +1092,31 @@
     return h('div', { class: 'ln' + (r.skip ? ' skipped' : '') },
       h('div', { class: 'who', title: r.file, text: r.who || 'Narration' }),
       h('div', { class: 'src', lang: 'ja', text: r.jp }),
-      h('div', null, ta, before, meta),
+      list_has_ref() ? h('div', { class: 'ref', 'data-label': 'Reference', text: r.ref || '' }) : null,
+      h('div', { class: 'en' }, ta, before, subtext, meta),
       h('div', { class: 'actions' },
         r.skip ? null : h('button', { class: 'mini', title: 'Translate this line again', 'aria-label': 'Translate this line again',
           onclick: () => safe(async () => { await call('retranslate', { ids: [r.id] }); refresh(); }) }, '↻'),
         h('button', { class: 'mini', title: r.skip ? 'Translate this line' : 'Don\'t translate this line', 'aria-label': r.skip ? 'Translate this line' : 'Skip this line',
           onclick: () => safe(async () => { await call('line', { id: r.id, skip: !r.skip }); loadLines(); }) }, r.skip ? '↺' : '×')));
   }
+
+  // ------------------------------------------------------------ game doctor
+  let diagText = '';
+  async function runDoctor() {
+    await safe(async () => {
+      const d = await call('diagnose');
+      diagText = d.text || '';
+      $('#diagBox').textContent = diagText;
+      $('#diagBox').hidden = false;
+      $('#copyDiag').hidden = false;
+    });
+  }
+  $('#runDoctor').addEventListener('click', runDoctor);
+  $('#copyDiag').addEventListener('click', () => safe(async () => {
+    await navigator.clipboard.writeText(diagText);
+    toast('Diagnostics copied.');
+  }));
 
   // ------------------------------------------------------------ log
   function renderLog() {

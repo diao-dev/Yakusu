@@ -291,6 +291,12 @@ pub fn descramble(data: &[u8]) -> Option<String> {
     Some(t.into_owned())
 }
 
+/// Starts like a KiriKiri Z scene file: a PSB, or a zlib-packed one ("mdf").
+/// Anything else with a .scn name is still encrypted.
+pub fn looks_like_scn(data: &[u8]) -> bool {
+    data.len() >= 4 && (data.starts_with(b"PSB\0") || data[..4].eq_ignore_ascii_case(b"mdf\0"))
+}
+
 /// Rough check that script bytes are text (used to spot encryption).
 pub fn looks_like_text(data: &[u8]) -> bool {
     if data.is_empty() {

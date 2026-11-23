@@ -23,11 +23,15 @@ pub struct TextBox {
     pub sample: usize,
     #[serde(default)]
     pub user_set: bool,
+    /// The game draws English in a proportional font: "i" takes less room
+    /// than "m", so more fits on a line than a fixed-width count says.
+    #[serde(default)]
+    pub proportional: bool,
 }
 
 impl Default for TextBox {
     fn default() -> Self {
-        TextBox { mode: "auto".into(), width: 56, lines: 3, sample: 0, user_set: false }
+        TextBox { mode: "auto".into(), width: 56, lines: 3, sample: 0, user_set: false, proportional: false }
     }
 }
 
@@ -88,48 +92,83 @@ pub fn measure_box(messages: &[String]) -> TextBox {
         lines: lines.min(8),
         sample: msgs.len(),
         user_set: false,
+        proportional: false,
     }
 }
 
-fn cut_at(word: &str, width: usize) -> usize {
+/// Width of `ch` in a proportional font, in tenths of a cell (an average
+/// Latin letter is about one cell, a Japanese character two).
+pub fn prop_units(ch: char) -> usize {
+    match cell_width(ch) {
+        0 => 0,
+        2 => 20,
+        _ => match ch {
+            ' ' => 6,
+            'i' | 'l' | 'j' | 'I' | '!' | '|' | '.' | ',' | ':' | ';' | '\'' | '`' => 5,
+            'f' | 't' | 'r' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '-' => 7,
+            'm' | 'w' | 'M' | 'W' | '@' | '%' => 15,
+            c if c.is_ascii_uppercase() => 12,
+            _ => 10,
+        },
+    }
+}
+
+/// Width of `ch` in tenths of a cell.
+fn units(ch: char, proportional: bool) -> usize {
+    if proportional {
+        prop_units(ch)
+    } else {
+        cell_width(ch) * 10
+    }
+}
+
+/// Width of `s` in tenths of a cell; codes count as zero.
+pub fn text_units(s: &str, proportional: bool) -> usize {
+    let plain = CODE_RE.replace_all(&PH_RE.replace_all(s, ""), "").into_owned();
+    plain.chars().map(|c| units(c, proportional)).sum()
+}
+
+fn cut_at(word: &str, limit: usize, proportional: bool) -> usize {
     let mut total = 0;
     for (i, ch) in word.char_indices() {
-        total += cell_width(ch);
-        if total > width {
+        total += units(ch, proportional);
+        if total > limit {
             return if i == 0 { ch.len_utf8() } else { i };
         }
     }
     word.len()
 }
 
-fn wrap_para(text: &str, width: usize, line_break: &str) -> (String, usize) {
+fn wrap_para(text: &str, width: usize, line_break: &str, proportional: bool) -> (String, usize) {
+    let limit = width * 10;
+    let space = units(' ', proportional);
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
     for w in text.split_whitespace() {
-        let mut w = w.to_string();
-        let mut ww = text_cells(&w);
-        if cur.is_empty() {
-            while ww > width {
-                // A single word longer than the box: hard break.
-                let cut = cut_at(&w, width);
-                lines.push(w[..cut].to_string());
-                w = w[cut..].to_string();
-                ww = text_cells(&w);
-            }
-            cur = w;
-            cur_w = ww;
-        } else if ww == 0 || cur_w + 1 + ww <= width {
+        let w = w.to_string();
+        let ww = text_units(&w, proportional);
+        if !cur.is_empty() && (ww == 0 || cur_w + space + ww <= limit) {
             if ww > 0 {
                 cur.push(' ');
-                cur_w += 1 + ww;
+                cur_w += space + ww;
             }
             cur.push_str(&w);
-        } else {
-            lines.push(std::mem::take(&mut cur));
-            cur = w;
-            cur_w = ww;
+            continue;
         }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        // A word longer than the box gets a hard break, wherever it falls.
+        let (mut w, mut ww) = (w, ww);
+        while ww > limit {
+            let cut = cut_at(&w, limit, proportional);
+            lines.push(w[..cut].to_string());
+            w = w[cut..].to_string();
+            ww = text_units(&w, proportional);
+        }
+        cur = w;
+        cur_w = ww;
     }
     if !cur.is_empty() {
         lines.push(cur);
@@ -141,6 +180,11 @@ fn wrap_para(text: &str, width: usize, line_break: &str) -> (String, usize) {
 /// Word-wrap by cells, keeping existing hard breaks. Returns (text, line count).
 /// Codes count as zero width and are never split.
 pub fn wrap(text: &str, width: usize, line_break: &str) -> (String, usize) {
+    wrap_mode(text, width, line_break, false)
+}
+
+/// [`wrap`], measuring English in a proportional font when `proportional`.
+pub fn wrap_mode(text: &str, width: usize, line_break: &str, proportional: bool) -> (String, usize) {
     if width == 0 || text.is_empty() {
         return (text.to_string(), usize::from(!text.is_empty()));
     }
@@ -156,7 +200,7 @@ pub fn wrap(text: &str, width: usize, line_break: &str) -> (String, usize) {
             }
             continue;
         }
-        let (w, n) = wrap_para(part, width, line_break);
+        let (w, n) = wrap_para(part, width, line_break, proportional);
         out.push(w);
         total += n;
     }
@@ -168,10 +212,10 @@ pub fn wrap(text: &str, width: usize, line_break: &str) -> (String, usize) {
 /// still insert breaks unless `insert_breaks` is false.
 pub fn fit(text: &str, b: &TextBox, line_break: &str, insert_breaks: bool) -> (String, usize) {
     if !insert_breaks {
-        let lines = text_cells(text).div_ceil(b.width.max(1)).max(1);
+        let lines = text_units(text, b.proportional).div_ceil(b.width.max(1) * 10).max(1);
         return (text.to_string(), lines.saturating_sub(b.lines));
     }
-    let (wrapped, n) = wrap(text, b.width, line_break);
+    let (wrapped, n) = wrap_mode(text, b.width, line_break, b.proportional);
     (wrapped, n.saturating_sub(b.lines))
 }
 

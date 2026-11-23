@@ -128,6 +128,47 @@ fn describe_folder(dir: &Path) -> String {
     )
 }
 
+/// The folder to open for `dir`, its engine matches, and a note for the log
+/// when Yakusu looked one level down. Unzipping a download often leaves the
+/// game one folder deeper than the folder that was picked: when `dir` has no
+/// game of its own and no .exe, and exactly one folder inside it holds a game
+/// Yakusu can read, that folder is opened instead.
+fn resolve_game_dir(dir: &Path) -> Result<(PathBuf, Vec<Match>, Option<String>)> {
+    let matches = engines::detect(dir)?;
+    if !matches.is_empty() {
+        return Ok((dir.to_path_buf(), matches, None));
+    }
+    let mut subdirs = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_file() && name.to_lowercase().ends_with(".exe") {
+            return Ok((dir.to_path_buf(), matches, None)); // this is the game's folder
+        }
+        let skip =
+            matches!(name.to_lowercase().as_str(), "save" | "saves" | "savedata" | "backup" | "backups" | "__macosx");
+        if ft.is_dir() && !skip && !name.starts_with('.') {
+            subdirs.push(e.path());
+        }
+    }
+    let mut found = Vec::new();
+    for sub in subdirs {
+        let m = engines::detect(&sub).unwrap_or_default();
+        if m.iter().any(|m| m.engine_id != "unsupported") {
+            found.push((sub, m));
+        }
+    }
+    if found.len() == 1 {
+        let (sub, m) = found.remove(0);
+        let note = format!(
+            "The game is in the folder {} inside the one you picked: opened that.",
+            sub.file_name().unwrap_or_default().to_string_lossy()
+        );
+        return Ok((sub, m, Some(note)));
+    }
+    Ok((dir.to_path_buf(), matches, None))
+}
+
 fn s_arg<'a>(args: &'a Value, k: &str) -> &'a str {
     args.get(k).and_then(Value::as_str).unwrap_or("")
 }
@@ -223,6 +264,17 @@ impl App {
                     .map(|v| v.iter().filter_map(|x| x.as_str()).filter(|x| !x.is_empty()).map(String::from).collect())
                     .unwrap_or_default();
                 self.retranslate(ids)
+            }
+            "lint" => self.pipeline()?.lint(),
+            "diagnose" => Ok(self.diagnose()),
+            "export_patch_zip" => self.export_patch_zip(),
+            "import_reference" => self.import_reference(s_arg(a, "text"), s_arg(a, "label")),
+            "clear_reference" => {
+                self.need_project()?.clear_reference()?;
+                Ok(json!({"ok": true}))
+            }
+            "subtext_action" => {
+                self.subtext_action(s_arg(a, "id"), a.get("accept").and_then(Value::as_bool).unwrap_or(false))
             }
             "export_csv" => self.export_csv(),
             "import_csv" => self.import_csv(s_arg(a, "text")),
@@ -411,8 +463,8 @@ impl App {
     fn project_state(&self, p: &Project) -> Value {
         let lines = p.lines();
         let live: Vec<&Line> = lines.iter().filter(|l| l.skip.is_empty()).collect();
-        let (done, reviewed, problems) = p.with_results(|res| {
-            let mut d = (0, 0, 0);
+        let (done, reviewed, problems, subtext) = p.with_results(|res| {
+            let mut d = (0, 0, 0, 0);
             for l in &live {
                 if let Some(r) = res.get(&l.id) {
                     if r.translated() {
@@ -423,6 +475,9 @@ impl App {
                     }
                     if !r.problems.is_empty() {
                         d.2 += 1;
+                    }
+                    if r.subtext_note.is_some() {
+                        d.3 += 1;
                     }
                 }
             }
@@ -445,6 +500,9 @@ impl App {
             "translated": done,
             "reviewed": reviewed,
             "problems": problems,
+            "subtext_flags": subtext,
+            "reference_count": p.reference_len(),
+            "reference_label": m.reference_label,
             "total": live.len(),
             "built_at": m.built_at,
             "installed": inst.installed(),
@@ -508,7 +566,7 @@ impl App {
                 game = dir.to_path_buf();
             }
         }
-        let matches = engines::detect(&game)?;
+        let (game, matches, descended) = resolve_game_dir(&game)?;
         let folder_note = if matches.is_empty() { Some(describe_folder(&game)) } else { None };
         {
             let mut j = self.job.lock().unwrap();
@@ -519,7 +577,15 @@ impl App {
         let p = Project::for_game(&self.env, &game)?;
         let top = matches.first().filter(|m| m.engine_id != "unsupported").cloned();
         p.update_meta(|m| {
-            if m.engine.is_none() {
+            // A game that was never read keeps the engine found when it was
+            // first opened, unless that engine no longer applies (the folder
+            // changed since, or the first look went wrong): then use what's
+            // found now. An engine chosen by hand stays while it still applies.
+            let stale = m.extracted_at.is_none()
+                && m.engine
+                    .as_ref()
+                    .is_some_and(|e| e.engine_id != "scripts" && !matches.iter().any(|x| x.engine_id == e.engine_id));
+            if m.engine.is_none() || (stale && top.is_some()) {
                 m.engine = top;
             }
             // A folder with no readable game doesn't belong in the recent list.
@@ -533,6 +599,9 @@ impl App {
         self.env.save_settings(&i.settings)?;
         drop(i);
         if !quiet {
+            if let Some(note) = &descended {
+                self.log(note);
+            }
             match matches.first() {
                 Some(m) => self.log(&format!("Opened {}: looks like {}.", game.display(), m.name)),
                 None => self.log(&format!("Opened {}: engine not recognized.", game.display())),
@@ -643,6 +712,9 @@ impl App {
         if let Some(v) = a.get("batch_api").and_then(Value::as_bool) {
             s.batch_api = v;
         }
+        if let Some(v) = a.get("smart_memory").and_then(Value::as_bool) {
+            s.smart_memory = v;
+        }
         let num =
             |k: &str| a.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
         if let Some(v) = num("budget_usd") {
@@ -716,6 +788,11 @@ impl App {
 
     fn set_box(&self, a: &Value) -> Result<Value> {
         let p = self.need_project()?;
+        // Only a change to the box itself marks it as set by hand (so a new
+        // read of the scripts doesn't measure it again).
+        let project_only = a
+            .as_object()
+            .is_some_and(|o| o.keys().all(|k| matches!(k.as_str(), "use_reference_in_prompt" | "bilingual")));
         p.update_meta(|m| {
             let mut b = m.text_box.clone().unwrap_or_default();
             if let Some(w) = a.get("width").and_then(Value::as_f64) {
@@ -724,13 +801,24 @@ impl App {
             if let Some(n) = a.get("lines").and_then(Value::as_f64) {
                 b.lines = (n as i64).clamp(1, 12) as usize;
             }
-            b.user_set = true;
-            m.text_box = Some(b);
+            if let Some(v) = a.get("proportional").and_then(Value::as_bool) {
+                b.proportional = v;
+            }
+            if !project_only {
+                b.user_set = true;
+                m.text_box = Some(b);
+            }
+            if let Some(v) = a.get("bilingual").and_then(Value::as_bool) {
+                m.settings.bilingual = v;
+            }
             if let Some(v) = a.get("insert_breaks").and_then(Value::as_bool) {
                 m.settings.insert_breaks = v;
             }
             if let Some(v) = a.get("quotes").and_then(Value::as_str) {
                 m.settings.quotes = v.into();
+            }
+            if let Some(v) = a.get("use_reference_in_prompt").and_then(Value::as_bool) {
+                m.settings.use_reference_in_prompt = v;
             }
             if let Some(v) = a.get("test_file") {
                 m.test_file = v.as_str().filter(|s| !s.is_empty()).map(String::from);
@@ -776,6 +864,9 @@ impl App {
         let names = p.glossary().names;
         let gloss =
             if matches!(flt, "glossary" | "all" | "problems") { pipe.glossary_issues() } else { HashMap::new() };
+        let over: std::collections::HashSet<String> =
+            if flt == "overflow" { pipe.overflow_lines()?.into_iter().collect() } else { Default::default() };
+        let refs = p.reference();
         let q = q.to_lowercase();
         let lines = p.lines();
         let (total, rows) = p.with_results(|res| {
@@ -790,6 +881,8 @@ impl App {
                     "translated" => tr,
                     "glossary" => gloss.contains_key(&l.id),
                     "reviewed" => r.is_some_and(|r| r.before.is_some()),
+                    "overflow" => over.contains(&l.id),
+                    "subtext" => r.is_some_and(|r| r.subtext_note.is_some()),
                     _ => true,
                 };
                 if !keep {
@@ -800,10 +893,12 @@ impl App {
                     let who = l.name.as_deref().unwrap_or("").to_lowercase();
                     let who_en =
                         l.name.as_ref().and_then(|n| names.get(n)).map(|s| s.to_lowercase()).unwrap_or_default();
+                    let rf = refs.get(&l.id).map(|s| s.to_lowercase()).unwrap_or_default();
                     if !l.jp.to_lowercase().contains(&q)
                         && !en.contains(&q)
                         && !who.contains(&q)
                         && !who_en.contains(&q)
+                        && !rf.contains(&q)
                     {
                         continue;
                     }
@@ -830,7 +925,9 @@ impl App {
                            "stage": r.map(|r| r.stage.clone()),
                            "problems": r.map(|r| r.problems.clone()).filter(|p| !p.is_empty()),
                            "skip": l.skip, "before": r.and_then(|r| r.before.clone()),
-                           "glossary": gloss.get(&l.id)})
+                           "glossary": gloss.get(&l.id), "ref": refs.get(&l.id),
+                           "subtext_note": r.and_then(|r| r.subtext_note.clone()),
+                           "subtext_suggestion": r.and_then(|r| r.subtext_suggestion.clone())})
                 })
                 .collect();
             (total, rows)
@@ -884,6 +981,28 @@ impl App {
         }
         if let Some(g) = a.get("glossary") {
             let mut gl: crate::project::Glossary = serde_json::from_value(g.clone()).unwrap_or_default();
+            // An older window that doesn't send character cards keeps them.
+            if g.get("characters").is_none() {
+                gl.characters = p.glossary().characters;
+            }
+            gl.characters = gl
+                .characters
+                .into_iter()
+                .filter(|c| !c.jp.trim().is_empty())
+                .map(|mut c| {
+                    c.jp = c.jp.trim().into();
+                    c.en = c.en.trim().into();
+                    c.pronouns = c.pronouns.trim().into();
+                    c.voice = c.voice.trim().into();
+                    c.address_rules = c
+                        .address_rules
+                        .into_iter()
+                        .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+                        .map(|(k, v)| (k.trim().into(), v.trim().into()))
+                        .collect();
+                    c
+                })
+                .collect();
             gl.names = gl
                 .names
                 .into_iter()
@@ -959,6 +1078,10 @@ impl App {
                 Ok(json!({}))
             }),
             "glossary" => self.start(action, move || Ok(json!(pipe.fix_glossary()?))),
+            "subtext" => self.start(action, move || {
+                pipe.ensure_read()?;
+                Ok(json!(pipe.subtext_qa(None)?))
+            }),
             _ => user(format!("Unknown action {action}")),
         }
     }
@@ -1094,6 +1217,349 @@ impl App {
         p.add_results(rows)?;
         self.log(&format!("Imported {changed} edited lines from CSV."));
         Ok(json!({"changed": changed, "problems": problems, "unknown": unknown}))
+    }
+
+    /// Accept a subtext suggestion (it becomes the line's English, the old
+    /// English kept as "before") or dismiss it.
+    fn subtext_action(&self, id: &str, accept: bool) -> Result<Value> {
+        let p = self.need_project()?;
+        let Some(cur) = p.result(id) else { return user("Line not found.") };
+        let Some(suggestion) = cur.subtext_suggestion.clone().filter(|_| cur.subtext_note.is_some()) else {
+            return user("That line has no suggestion to act on.");
+        };
+        let mut r = (*cur).clone();
+        r.subtext_note = None;
+        r.subtext_suggestion = None;
+        r.t = 0.0;
+        if accept {
+            let line = p.lines().iter().find(|l| l.id == id).cloned();
+            let Some(line) = line else { return user("Line not found.") };
+            let eng = self.pipeline()?.engine()?;
+            let probs: Vec<String> = check(&protect(&line.jp, eng.line_break_for(&line.file)), Some(&suggestion))
+                .into_iter()
+                .filter(|x| x != "still has Japanese")
+                .collect();
+            if !probs.is_empty() {
+                return user(format!(
+                    "That suggestion would break the line ({}). Edit it by hand instead.",
+                    probs.join(", ")
+                ));
+            }
+            r.before = Some(cur.en_ph.clone());
+            r.en_ph = suggestion;
+            r.stage = "manual".into();
+            r.model = "subtext".into();
+            r.src = Some(line.jp.clone());
+            r.problems = vec![];
+        }
+        p.add_results(vec![r])?;
+        Ok(json!({"ok": true}))
+    }
+
+    /// Load a reference translation: an existing translation of this game
+    /// (another language, an older patch) shown beside each line.
+    ///
+    /// Accepted: CSV with an "id" or "japanese" column and a text column
+    /// (reference, ref, kr, korean, translation, english, text or message);
+    /// a JSON array of strings (one per line, in order) or of objects
+    /// (matched by "id", by "jp"/"japanese", else by position); or a JSON
+    /// object {id or Japanese: text}.
+    fn import_reference(&self, text: &str, label: &str) -> Result<Value> {
+        const REF_COLS: &[&str] = &["reference", "ref", "kr", "korean", "translation", "english", "text", "message"];
+        let p = self.need_project()?;
+        let eng = self.pipeline()?.engine()?;
+        let live = p.live_lines();
+        let by_id: HashMap<&str, usize> = live.iter().enumerate().map(|(k, l)| (l.id.as_str(), k)).collect();
+        // Japanese as written, without the game's codes, and without spaces.
+        let norm = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let mut by_jp: HashMap<String, Vec<usize>> = HashMap::new();
+        for (k, l) in live.iter().enumerate() {
+            let pr = protect(&l.jp, eng.line_break_for(&l.file));
+            let mut keys = vec![norm(&l.jp), norm(&pr.text), norm(&crate::protect::strip_codes(&pr.text))];
+            keys.sort();
+            keys.dedup();
+            for key in keys.into_iter().filter(|k| !k.is_empty()) {
+                by_jp.entry(key).or_default().push(k);
+            }
+        }
+        let mut map: HashMap<String, String> = HashMap::new();
+        let (mut rows, mut unmatched) = (0usize, 0usize);
+        let mut put = |targets: Vec<usize>, value: &str, map: &mut HashMap<String, String>| {
+            let v = value.trim();
+            if v.is_empty() {
+                return;
+            }
+            if targets.is_empty() {
+                unmatched += 1;
+            }
+            for k in targets {
+                map.insert(live[k].id.clone(), v.to_string());
+            }
+        };
+        let find = |id: Option<&str>, jp: Option<&str>| -> Option<Vec<usize>> {
+            if let Some(k) = id.and_then(|i| by_id.get(i.trim())) {
+                return Some(vec![*k]);
+            }
+            jp.map(|j| by_jp.get(&norm(j)).cloned().unwrap_or_default())
+        };
+        let body = text.trim_start_matches('\u{feff}').trim();
+        if body.starts_with('[') || body.starts_with('{') {
+            let v: Value =
+                serde_json::from_str(body).map_err(|e| Error::User(format!("That JSON couldn't be read: {e}")))?;
+            match v {
+                Value::Array(items) => {
+                    for (pos, it) in items.iter().enumerate() {
+                        rows += 1;
+                        let (targets, value) = match it {
+                            Value::String(s) => (live.get(pos).map(|_| vec![pos]).unwrap_or_default(), s.clone()),
+                            Value::Object(o) => {
+                                let get = |k: &str| o.get(k).and_then(Value::as_str);
+                                let jp = get("jp").or_else(|| get("japanese"));
+                                let value = REF_COLS.iter().find_map(|c| get(c)).unwrap_or("").to_string();
+                                let targets = find(get("id"), jp)
+                                    .unwrap_or_else(|| live.get(pos).map(|_| vec![pos]).unwrap_or_default());
+                                (targets, value)
+                            }
+                            _ => continue,
+                        };
+                        put(targets, &value, &mut map);
+                    }
+                }
+                Value::Object(o) => {
+                    for (k, v) in o {
+                        rows += 1;
+                        let Some(value) = v.as_str() else { continue };
+                        let targets = find(Some(&k), Some(&k)).unwrap_or_default();
+                        put(targets, value, &mut map);
+                    }
+                }
+                _ => return user("That JSON should be a list of lines or an object of {line: text}."),
+            }
+        } else {
+            let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(body.as_bytes());
+            let headers = rdr.headers().map_err(|e| Error::User(format!("That CSV couldn't be read: {e}")))?.clone();
+            let col = |name: &str| headers.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
+            let ci = col("id");
+            let cj = col("japanese").or_else(|| col("jp"));
+            let Some(cr) = REF_COLS.iter().find_map(|c| col(c)) else {
+                return user(
+                    "That CSV needs a column with the reference text, named reference, translation, korean, english or text.",
+                );
+            };
+            if ci.is_none() && cj.is_none() {
+                return user("That CSV needs an \"id\" or \"japanese\" column to match its rows to the game's lines.");
+            }
+            for rec in rdr.records().flatten() {
+                rows += 1;
+                let targets = find(ci.and_then(|c| rec.get(c)), cj.and_then(|c| rec.get(c))).unwrap_or_default();
+                put(targets, rec.get(cr).unwrap_or(""), &mut map);
+            }
+        }
+        if map.is_empty() {
+            return user("None of that file's lines matched this game's lines, so nothing was loaded.");
+        }
+        let label = Some(label.trim()).filter(|l| !l.is_empty()).map(String::from);
+        let matched = map.len();
+        p.set_reference(map, label)?;
+        self.log(&format!("Loaded a reference translation for {matched} of {} lines.", live.len()));
+        Ok(json!({"matched": matched, "rows": rows, "unmatched": unmatched, "total": live.len()}))
+    }
+
+    /// Game Doctor: everything worth knowing when a game won't open, in one
+    /// report to read or paste into a bug report. Reads only; changes nothing.
+    fn diagnose(&self) -> Value {
+        let tool = |name: &str| self.env.tool_path(name).map(|p| p.to_string_lossy().to_string());
+        let msg_tool = tool("msg-tool").or_else(|| tool("msg_tool"));
+        let vntp = tool("VNTextPatch");
+        let dll = self.env.tools.join("kirikiri").join("version.dll");
+        let dll = dll.is_file().then(|| dll.to_string_lossy().to_string());
+        let project = self.project();
+        let (folder_note, matches) = {
+            let i = self.inner.lock().unwrap();
+            (i.folder_note.clone(), i.matches.clone())
+        };
+        let mut game = json!(null);
+        let mut entries_text = Vec::new();
+        if let Some(p) = &project {
+            let dir = p.game_dir();
+            let mut entries = Vec::new();
+            let (mut readonly, mut exes, mut count) = (0usize, 0usize, 0usize);
+            let mut listing: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir).into_iter().flatten().flatten().collect();
+            listing.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+            for e in listing {
+                count += 1;
+                let name = e.file_name().to_string_lossy().to_string();
+                let Ok(meta) = e.metadata() else { continue };
+                if meta.is_file() && meta.permissions().readonly() {
+                    readonly += 1;
+                }
+                if name.to_lowercase().ends_with(".exe") {
+                    exes += 1;
+                }
+                if entries.len() >= 60 {
+                    continue;
+                }
+                let magic = if meta.is_file() {
+                    use std::io::Read;
+                    let mut head = [0u8; 8];
+                    let n = std::fs::File::open(e.path()).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+                    head[..n].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+                } else {
+                    String::new()
+                };
+                entries_text.push(if meta.is_dir() {
+                    format!("  {name}/")
+                } else {
+                    format!("  {name}  {} bytes  [{magic}]", meta.len())
+                });
+                entries.push(json!({"name": name, "dir": meta.is_dir(), "size": meta.len(), "magic": magic}));
+            }
+            let m = p.meta().clone();
+            game = json!({
+                "path": dir, "exists": dir.is_dir(), "entries": entries, "entry_count": count,
+                "readonly_files": readonly, "exe_count": exes,
+                "engine": m.engine.as_ref().map(|e| json!({"id": e.engine_id, "name": e.name, "details": e.details})),
+                "read": m.extracted_at.is_some(), "lines": m.stats.as_ref().map(|s| s.lines),
+            });
+        }
+        let job = self.job();
+        let logs: Vec<String> = self.logs().into_iter().rev().take(25).rev().map(|l| l.m).collect();
+        let yes = |v: &Option<String>| v.clone().unwrap_or_else(|| "MISSING".into());
+        let mut t = vec![
+            format!("Yakusu {} on {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+            format!("Tools folder: {}", self.env.tools.display()),
+            format!("msg-tool: {}", yes(&msg_tool)),
+            format!("VNTextPatch: {}", vntp.clone().unwrap_or_else(|| "missing (only needed for some engines)".into())),
+            format!(
+                "kirikiri/version.dll: {}",
+                dll.clone().unwrap_or_else(|| "missing (only needed for encrypted Kirikiri)".into())
+            ),
+        ];
+        match &project {
+            Some(_) => {
+                t.push(format!(
+                    "Game folder: {} ({})",
+                    game["path"].as_str().unwrap_or(""),
+                    if game["exists"] == true { "exists" } else { "NOT FOUND" }
+                ));
+                t.push(format!(
+                    "Engine: {}",
+                    game["engine"]["name"].as_str().map(String::from).unwrap_or_else(|| "not recognised".into())
+                ));
+                if !matches.is_empty() {
+                    t.push(format!(
+                        "Also matched: {}",
+                        matches.iter().map(|m| m.name.clone()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if let Some(n) = &folder_note {
+                    t.push(format!("Note: {n}"));
+                }
+                t.push(format!(
+                    "{} entries, {} .exe, {} read-only file(s){}",
+                    game["entry_count"],
+                    game["exe_count"],
+                    game["readonly_files"],
+                    if game["readonly_files"].as_u64().unwrap_or(0) > 0 {
+                        " (Yakusu clears this when it installs)"
+                    } else {
+                        ""
+                    }
+                ));
+                t.push("Files (first 8 bytes in hex):".into());
+                t.extend(entries_text);
+            }
+            None => t.push("No game is open.".into()),
+        }
+        if let Some(e) = &job.error {
+            t.push(format!("Last error ({}): {e}", job.action.clone().unwrap_or_default()));
+        }
+        t.push("Recent activity:".into());
+        t.extend(logs.iter().map(|l| format!("  {l}")));
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "tools_dir": self.env.tools,
+            "tools": {"msg-tool": msg_tool, "VNTextPatch": vntp, "version.dll": dll},
+            "game": game,
+            "folder_note": folder_note,
+            "last_error": job.error,
+            "logs": logs,
+            "text": t.join("\n"),
+        })
+    }
+
+    /// The built patch as one .zip to share: the files Yakusu installs (or,
+    /// for engines it can't repack, the patched scripts) and a README.
+    fn export_patch_zip(&self) -> Result<Value> {
+        use std::io::Write;
+        let p = self.need_project()?;
+        let m = p.meta().clone();
+        let manual = m.engine.as_ref().and_then(|e| e.str("manual_output")).map(PathBuf::from);
+        let out = p.work("out");
+        let (src, is_manual) = match engines::list_files(&out, None).is_empty() {
+            false => (out, false),
+            true => match manual.filter(|d| !engines::list_files(d, None).is_empty()) {
+                Some(d) => (d, true),
+                None => {
+                    return user("Build the patch first (Translate, or Apply on the Text box page), then export it.")
+                }
+            },
+        };
+        let files = engines::list_files(&src, None);
+        let game_dir = PathBuf::from(&m.game_dir);
+        let name = game_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "game".into());
+        let engine = m.engine.as_ref().map(|e| e.name.clone()).unwrap_or_default();
+        let total = m.stats.as_ref().map(|s| s.lines).unwrap_or(0);
+        let done = p.with_results(|res| {
+            p.live_lines().iter().filter(|l| res.get(&l.id).is_some_and(|r| r.translated())).count()
+        });
+        let stamp = chrono::Local::now();
+        let mut readme = vec![
+            format!("English patch for {name}"),
+            format!("Made with Yakusu {} on {}.", env!("CARGO_PKG_VERSION"), stamp.format("%Y-%m-%d")),
+            format!("Engine: {engine}. Lines translated: {done} of {total}."),
+            String::new(),
+        ];
+        if is_manual {
+            readme.push("These are the game's script files with the English written in. This engine's archives can't be rebuilt automatically yet: pack them back with the engine's own tools.".into());
+        } else {
+            readme.extend([
+                "How to install:".to_string(),
+                "1. Back up the game folder, or at least the files listed below that it already has.".into(),
+                "2. Copy everything in this zip except this README into the game's folder (the one with its .exe), keeping the folders as they are. Replace files when asked.".into(),
+                "To remove it: put the backed-up files back (on Steam: Properties > Installed Files > Verify integrity) and delete the files the patch added.".into(),
+            ]);
+        }
+        readme.push(String::new());
+        readme.push("Files:".into());
+        readme.extend(files.iter().map(|f| format!("  {f}")));
+        let folder = p.path("exports");
+        std::fs::create_dir_all(&folder)?;
+        let slug: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect::<String>()
+            .trim_matches('_')
+            .chars()
+            .take(40)
+            .collect();
+        let slug = if slug.is_empty() { "game".to_string() } else { slug };
+        let path = folder.join(format!("{slug}-en-patch-{}.zip", stamp.format("%Y%m%d-%H%M%S")));
+        let zerr = |e: zip::result::ZipError| Error::User(format!("Couldn't write the zip: {e}"));
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        z.start_file("README-PATCH.txt", opts).map_err(zerr)?;
+        z.write_all(readme.join("\r\n").as_bytes())?;
+        for f in &files {
+            z.start_file(f.as_str(), opts).map_err(zerr)?;
+            let mut input = std::fs::File::open(engines::join_rel(&src, f))?;
+            std::io::copy(&mut input, &mut z)?;
+        }
+        z.finish().map_err(zerr)?;
+        self.log(&format!("Exported the patch to {}", path.display()));
+        let _ = (self.opener)(&folder);
+        Ok(json!({"path": path, "files": files.len()}))
     }
 
     fn launch(&self) -> Result<Value> {

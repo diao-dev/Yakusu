@@ -14,10 +14,15 @@ Return ONLY a JSON object:
                   how to handle sound effects, ellipses and stammering, and anything unusual in this script.
                   Concrete and short, 150-400 words.",
   "names": [{"jp": "speaker name as written", "en": "English name", "notes": "gender / role if clear"}],
-  "terms": [{"jp": "recurring term, place or invented word", "en": "rendering"}]
+  "terms": [{"jp": "recurring term, place or invented word", "en": "rendering"}],
+  "characters": [{"jp": "speaker name as written", "en": "English name", "pronouns": "she/her",
+                  "voice": "one or two sentences: register, verbal tics, how formal",
+                  "address_rules": {"other character's Japanese name": "how this character addresses them in English"}}]
 }
 Use the standard romanization (Hepburn, no macrons) for Japanese names unless the game itself
-shows a different spelling. Include EVERY speaker name from the list in "names"."#;
+shows a different spelling. Include EVERY speaker name from the list in "names".
+Give "characters" only for the main cast (up to 12), with address rules only where they matter
+(nicknames, "senpai", formal vs first name)."#;
 
 const TRANSLATE_SYSTEM: &str = r#"You are translating a Japanese visual novel into English for a game patch.
 Write natural, readable English that keeps the meaning, tone and each character's voice.
@@ -56,6 +61,29 @@ Return ONLY a JSON array with the lines you changed:
 [{"i": 3, "en": "improved line"}]
 Return [] if nothing needs changing."#;
 
+/// Added to the translation rules when lines carry a reference translation.
+pub const REFERENCE_RULE: &str = r#"- Some lines include "ref": an existing translation of that line (possibly in another
+  language, possibly loose). Use it only to cross-check meaning, tone and subtext. Translate
+  from the Japanese; never copy the reference's wording or follow it where it departs from the Japanese."#;
+
+const SUBTEXT_SYSTEM: &str = r#"You are a literary subtext critic reviewing an English visual novel translation.
+For each line you get the Japanese original ("jp"), the current English ("en") and sometimes "ref",
+an existing translation of the same line to compare against.
+Flag only lines that clearly need it, usually no more than 5-15% of them:
+- stiff, word-for-word phrasing a native speaker wouldn't say,
+- an idiom, implication, joke or emotional undertone that the English flattens or loses,
+- a character's voice or register drifting from how they talk elsewhere.
+Don't flag lines that are fine, and don't nitpick. For each flagged line give a short note saying
+what is lost, and a rewrite that keeps the meaning and every placeholder like ⟦1⟧ exactly once.
+No quotation marks around lines and no line breaks.
+
+{style}
+
+{glossary}
+
+Return ONLY a JSON array: [{"i": 3, "note": "what the English loses", "en": "suggested rewrite"}]
+Return [] if every line reads well."#;
+
 pub const SHORTEN_SYSTEM: &str = r#"You fit English visual novel lines into a fixed-size text box.
 Each line comes with "max", the maximum number of characters it may use (spaces included).
 Rewrite each line to fit within its limit while keeping the meaning, tone and character voice.
@@ -81,6 +109,35 @@ pub fn glossary_block(g: &Glossary) -> String {
             g.terms.iter().filter(|t| !t.jp.is_empty() && !t.en.is_empty()).map(|t| format!("- {} -> {}", t.jp, t.en)),
         );
     }
+    let cards: Vec<String> = g
+        .characters
+        .iter()
+        .filter(|c| !c.jp.trim().is_empty())
+        .map(|c| {
+            let name = if c.en.trim().is_empty() { c.jp.clone() } else { format!("{} ({})", c.en.trim(), c.jp.trim()) };
+            let mut parts = Vec::new();
+            if !c.pronouns.trim().is_empty() {
+                parts.push(c.pronouns.trim().to_string());
+            }
+            if !c.voice.trim().is_empty() {
+                parts.push(c.voice.trim().to_string());
+            }
+            let addr: Vec<String> = c
+                .address_rules
+                .iter()
+                .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+                .map(|(k, v)| format!("{} -> \"{}\"", k.trim(), v.trim()))
+                .collect();
+            if !addr.is_empty() {
+                parts.push(format!("calls {}", addr.join(", ")));
+            }
+            format!("- {name}: {}", parts.join("; "))
+        })
+        .collect();
+    if !cards.is_empty() {
+        out.push("Character voices & address rules:".into());
+        out.extend(cards);
+    }
     out.join("\n")
 }
 
@@ -103,4 +160,16 @@ pub fn translate_system(style: &str, g: &Glossary) -> String {
 
 pub fn review_system(style: &str, g: &Glossary) -> String {
     fill(REVIEW_SYSTEM, style, g)
+}
+
+pub fn subtext_system(style: &str, g: &Glossary) -> String {
+    fill(SUBTEXT_SYSTEM, style, g)
+}
+
+/// The translation prompt with the reference rule added to its rules.
+pub fn with_reference_rule(system: &str) -> String {
+    match system.find("\n\nReturn ONLY") {
+        Some(at) => format!("{}\n{}{}", &system[..at], REFERENCE_RULE, &system[at..]),
+        None => format!("{system}\n{REFERENCE_RULE}"),
+    }
 }
