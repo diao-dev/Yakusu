@@ -26,7 +26,7 @@ pub const PATCH_MARKER: &str = "yakusu-patch.json";
 /// Archives that only ever hold images, audio or video: never worth decrypting.
 static MEDIA_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)^(voice|bgm|se|sound|sysse|image|bgimage|fgimage|evimage|video|movie|fg|bg|ev|chara|face|thum)\d*\.xp3$",
+        r"(?i)^(voice|vo|bgm|se|sound|sysse|image|bgimage|fgimage|evimage|video|movie|fg|bg|ev|cg|stand|chara|face|thum|thumb|thumbs|graphic|graphics)([_\-]?\d+|[_\-][a-z])?\.xp3$",
     )
     .unwrap()
 });
@@ -149,6 +149,32 @@ pub struct Kirikiri {
 }
 
 impl Kirikiri {
+    /// An archive entry name as a '/'-separated path. A harmless leading
+    /// "./" some packers write is dropped; anything else (a lone ".",
+    /// "./../x") is left for [`super::safe_rel`] to refuse.
+    pub fn clean_entry_name(name: &str) -> String {
+        let mut n = name.replace('\\', "/");
+        while let Some(rest) = n.strip_prefix("./") {
+            if rest.is_empty() {
+                break;
+            }
+            n = rest.to_string();
+        }
+        n
+    }
+
+    /// The bytes of a script read straight from an archive are readable
+    /// text (or a scrambled script that descrambles), not encrypted data.
+    fn plain_script(name: &str, data: &[u8]) -> bool {
+        if name.to_lowercase().ends_with(".scn") {
+            return xp3::looks_like_scn(data);
+        }
+        if xp3::is_scrambled(data) {
+            return xp3::descramble(data).is_some();
+        }
+        xp3::looks_like_text(data) && !ks::garbled(&ks::decode(data).0)
+    }
+
     fn source_archives(&self, cx: &Ctx) -> Vec<String> {
         let added: BTreeSet<String> = Installer::new(cx.project).manifest.added.into_iter().collect();
         let mut out: Vec<String> = dir_names(&cx.game())
@@ -189,7 +215,7 @@ impl Kirikiri {
     /// folder, before anything is extracted from it.
     fn check_names(arc: &str, entries: &[xp3::Entry]) -> Result<()> {
         for e in entries.iter().filter(|e| is_script(&e.name)) {
-            super::safe_rel(&e.name).map_err(|err| Error::User(format!("{arc}: {err}")))?;
+            super::safe_rel(&Self::clean_entry_name(&e.name)).map_err(|err| Error::User(format!("{arc}: {err}")))?;
         }
         Ok(())
     }
@@ -247,7 +273,11 @@ impl Engine for Kirikiri {
         let mut origin: BTreeMap<String, String> = BTreeMap::new();
         let mut plain_archives: BTreeSet<String> = BTreeSet::new();
         let inst = Installer::new(cx.project);
-        for arc in self.source_archives(cx) {
+        let archives = self.source_archives(cx);
+        // With several archives, one that can't be decrypted (often a media
+        // archive with a scheme of its own) shouldn't stop the others.
+        let mut last_unpack_err: Option<Error> = None;
+        for arc in archives.clone() {
             let path = inst.original(&game, &arc)?;
             let entries = xp3::read_index(&path).ok();
             if let Some(entries) = &entries {
@@ -271,16 +301,24 @@ impl Engine for Kirikiri {
                 }
                 // Can we read the scripts ourselves? Then the archive isn't encrypted.
                 if has_scripts {
-                    let sample = entries.iter().find(|e| is_script(&e.name)).unwrap();
-                    let readable = xp3::read_file(&path, sample)
-                        .map(|d| xp3::looks_like_text(&d) || sample.name.to_lowercase().ends_with(".scn"))
-                        .unwrap_or(false);
-                    if readable && sample.encrypted_flag == 0 {
+                    // An empty script says nothing about encryption: sample
+                    // the first one that has content.
+                    let sample = entries
+                        .iter()
+                        .find(|e| is_script(&e.name) && e.size > 0)
+                        .or_else(|| entries.iter().find(|e| is_script(&e.name)))
+                        .unwrap();
+                    let data = xp3::read_file(&path, sample).ok();
+                    let readable =
+                        data.as_deref().is_some_and(|d| sample.size == 0 || Self::plain_script(&sample.name, d));
+                    // Some packers set the "encrypted" flag on scripts that
+                    // aren't: trust what the bytes say when they read as text.
+                    if readable && (sample.encrypted_flag == 0 || sample.size > 0) {
                         cx.log(format!("Reading {arc} ({} files)", entries.len()));
                         plain_archives.insert(arc.clone());
                         for e in entries.iter().filter(|e| is_script(&e.name)) {
                             let data = xp3::read_file(&path, e)?;
-                            let rel = e.name.replace('\\', "/");
+                            let rel = Self::clean_entry_name(&e.name);
                             Self::save_script(&scripts_dir, &rel, data)?;
                             origin.insert(rel, arc.clone());
                             found += 1;
@@ -315,7 +353,16 @@ impl Engine for Kirikiri {
             let tmp = cx.project.work(&format!("unpack/{}", super::generic::dir_key(&arc)));
             clean_dir(&tmp)?;
             cx.log(format!("Decrypting {arc} with msg-tool"));
-            msgtool::unpack(cx, &path, &tmp, None, &["--xp3-game-title".into(), title.clone().unwrap()])?;
+            if let Err(e) = msgtool::unpack(cx, &path, &tmp, None, &["--xp3-game-title".into(), title.clone().unwrap()])
+            {
+                let _ = super::remove_dir_force(&tmp);
+                if archives.len() > 1 {
+                    cx.log(format!("Warning: couldn't decrypt {arc}, so its scripts are left out ({e})."));
+                    last_unpack_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
             for rel in list_files(&tmp, None) {
                 if is_script(&rel) {
                     let data = fs::read(join_rel(&tmp, &rel))?;
@@ -324,9 +371,12 @@ impl Engine for Kirikiri {
                     found += 1;
                 }
             }
-            let _ = fs::remove_dir_all(&tmp);
+            let _ = super::remove_dir_force(&tmp);
         }
         if found == 0 {
+            if let Some(e) = last_unpack_err {
+                return Err(e);
+            }
             return user("No Kirikiri scenario scripts (.ks / .scn) were found in this game's .xp3 archives.");
         }
         // Unpacking without an error doesn't mean decryption worked: a wrong

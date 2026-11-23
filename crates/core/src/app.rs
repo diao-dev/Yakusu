@@ -128,6 +128,47 @@ fn describe_folder(dir: &Path) -> String {
     )
 }
 
+/// The folder to open for `dir`, its engine matches, and a note for the log
+/// when Yakusu looked one level down. Unzipping a download often leaves the
+/// game one folder deeper than the folder that was picked: when `dir` has no
+/// game of its own and no .exe, and exactly one folder inside it holds a game
+/// Yakusu can read, that folder is opened instead.
+fn resolve_game_dir(dir: &Path) -> Result<(PathBuf, Vec<Match>, Option<String>)> {
+    let matches = engines::detect(dir)?;
+    if !matches.is_empty() {
+        return Ok((dir.to_path_buf(), matches, None));
+    }
+    let mut subdirs = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_file() && name.to_lowercase().ends_with(".exe") {
+            return Ok((dir.to_path_buf(), matches, None)); // this is the game's folder
+        }
+        let skip =
+            matches!(name.to_lowercase().as_str(), "save" | "saves" | "savedata" | "backup" | "backups" | "__macosx");
+        if ft.is_dir() && !skip && !name.starts_with('.') {
+            subdirs.push(e.path());
+        }
+    }
+    let mut found = Vec::new();
+    for sub in subdirs {
+        let m = engines::detect(&sub).unwrap_or_default();
+        if m.iter().any(|m| m.engine_id != "unsupported") {
+            found.push((sub, m));
+        }
+    }
+    if found.len() == 1 {
+        let (sub, m) = found.remove(0);
+        let note = format!(
+            "The game is in the folder {} inside the one you picked: opened that.",
+            sub.file_name().unwrap_or_default().to_string_lossy()
+        );
+        return Ok((sub, m, Some(note)));
+    }
+    Ok((dir.to_path_buf(), matches, None))
+}
+
 fn s_arg<'a>(args: &'a Value, k: &str) -> &'a str {
     args.get(k).and_then(Value::as_str).unwrap_or("")
 }
@@ -508,7 +549,7 @@ impl App {
                 game = dir.to_path_buf();
             }
         }
-        let matches = engines::detect(&game)?;
+        let (game, matches, descended) = resolve_game_dir(&game)?;
         let folder_note = if matches.is_empty() { Some(describe_folder(&game)) } else { None };
         {
             let mut j = self.job.lock().unwrap();
@@ -519,7 +560,15 @@ impl App {
         let p = Project::for_game(&self.env, &game)?;
         let top = matches.first().filter(|m| m.engine_id != "unsupported").cloned();
         p.update_meta(|m| {
-            if m.engine.is_none() {
+            // A game that was never read keeps the engine found when it was
+            // first opened, unless that engine no longer applies (the folder
+            // changed since, or the first look went wrong): then use what's
+            // found now. An engine chosen by hand stays while it still applies.
+            let stale = m.extracted_at.is_none()
+                && m.engine
+                    .as_ref()
+                    .is_some_and(|e| e.engine_id != "scripts" && !matches.iter().any(|x| x.engine_id == e.engine_id));
+            if m.engine.is_none() || (stale && top.is_some()) {
                 m.engine = top;
             }
             // A folder with no readable game doesn't belong in the recent list.
@@ -533,6 +582,9 @@ impl App {
         self.env.save_settings(&i.settings)?;
         drop(i);
         if !quiet {
+            if let Some(note) = &descended {
+                self.log(note);
+            }
             match matches.first() {
                 Some(m) => self.log(&format!("Opened {}: looks like {}.", game.display(), m.name)),
                 None => self.log(&format!("Opened {}: engine not recognized.", game.display())),

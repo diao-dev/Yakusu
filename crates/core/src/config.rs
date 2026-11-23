@@ -117,7 +117,10 @@ pub fn write_json_atomic(path: &Path, v: &Value) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(v)?)?;
-    std::fs::rename(&tmp, path)
+    // Waits out a brief antivirus lock and replaces a read-only file.
+    crate::engines::rename_retry(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

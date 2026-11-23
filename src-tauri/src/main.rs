@@ -27,22 +27,57 @@ async fn call(core: tauri::State<'_, Core>, cmd: String, args: Value) -> Result<
         .map_err(|e| format!("Unexpected error: {e}"))?
 }
 
+/// The unpacked tools in `dir` are all still there: `.complete` names this
+/// version and every file it lists exists. Antivirus software sometimes
+/// quarantines msg-tool.exe after it was unpacked; then it's unpacked again.
+fn tools_intact(dir: &Path) -> bool {
+    let Ok(done) = std::fs::read_to_string(dir.join(".complete")) else { return false };
+    let mut lines = done.lines();
+    if lines.next().map(str::trim) != Some(TOOLS_HASH.trim()) {
+        return false;
+    }
+    let files: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).collect();
+    if files.is_empty() {
+        // Written by an older Yakusu (the hash only): check the main tool.
+        return dir.join("msg-tool.exe").is_file() || dir.join("msg-tool").is_file();
+    }
+    files.iter().all(|rel| dir.join(rel).is_file())
+}
+
 /// Unpack the embedded tools once per version into the data folder.
 fn unpack_tools(home: &Path) -> Option<PathBuf> {
     if TOOLS_ZIP.is_empty() {
         return None;
     }
+    let _ = std::fs::create_dir_all(home);
     let dir = home.join(format!("tools-{TOOLS_HASH}"));
-    if dir.join(".complete").exists() {
+    if tools_intact(&dir) {
         return Some(dir);
     }
     let tmp = home.join(format!("tools-{TOOLS_HASH}.part"));
     let _ = std::fs::remove_dir_all(&tmp);
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(TOOLS_ZIP)).ok()?;
+    let files: Vec<String> = (0..z.len())
+        .filter_map(|i| z.by_index(i).ok().filter(|f| !f.is_dir()).and_then(|f| f.enclosed_name()))
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
     z.extract(&tmp).ok()?;
-    std::fs::write(tmp.join(".complete"), TOOLS_HASH).ok()?;
+    std::fs::write(tmp.join(".complete"), format!("{}\n{}\n", TOOLS_HASH.trim(), files.join("\n"))).ok()?;
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::rename(&tmp, &dir).ok()?;
+    // Windows Defender holds a freshly written .exe or .dll for a moment
+    // while it scans it, and the folder can't be renamed until it lets go.
+    let mut moved = false;
+    for _ in 0..10 {
+        if std::fs::rename(&tmp, &dir).is_ok() {
+            moved = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    if !moved {
+        // Still locked: use the tools where they are. The next start moves them.
+        return tools_intact(&tmp).then_some(tmp);
+    }
     // Older unpacked versions are no longer needed.
     if let Ok(rd) = std::fs::read_dir(home) {
         for e in rd.flatten() {

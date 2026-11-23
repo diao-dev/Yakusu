@@ -346,13 +346,13 @@ impl Pipeline {
         for d in DIRS {
             let p = self.p.work(d);
             if p.exists() {
-                std::fs::rename(&p, stash.join(d))?;
+                engines::rename_retry(&p, &stash.join(d))?;
             }
         }
         let engine_before = self.p.meta().engine.clone();
         match self.read_scripts() {
             Ok((stats, lines, measured)) => {
-                let _ = std::fs::remove_dir_all(&stash);
+                let _ = engines::remove_dir_force(&stash);
                 self.p.set_lines(lines)?;
                 let st = stats.clone();
                 self.p.update_meta(move |m| {
@@ -380,14 +380,14 @@ impl Pipeline {
         for d in dirs {
             let p = self.p.work(d);
             if p.exists() {
-                std::fs::remove_dir_all(&p)?;
+                engines::remove_dir_force(&p)?;
             }
             let s = stash.join(d);
             if s.exists() {
-                std::fs::rename(&s, &p)?;
+                engines::rename_retry(&s, &p)?;
             }
         }
-        std::fs::remove_dir_all(stash)?;
+        engines::remove_dir_force(stash)?;
         Ok(())
     }
 
