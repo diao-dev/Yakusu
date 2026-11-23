@@ -449,3 +449,252 @@ fn subtext_qa_flags_and_accept_dismiss_flow() {
     }
     assert_eq!(call(&a, "state", json!({}))["project"]["subtext_flags"], flagged.len().saturating_sub(2));
 }
+
+// ------------------------------------------------------------------ v0.5 pipeline
+
+#[test]
+fn file_scoped_sequential_context_and_smart_short_line_memory() {
+    use yakusu_core::pipeline::file_batch_groups;
+    use yakusu_core::project::Line;
+    let mk = |file: &str, n: usize| -> Vec<Line> {
+        (0..n)
+            .map(|i| Line {
+                id: format!("{file}#{i}"),
+                file: file.into(),
+                idx: i,
+                jp: "あ".into(),
+                ..Default::default()
+            })
+            .collect()
+    };
+    let mut lines = mk("a", 5);
+    lines.extend(mk("b", 3));
+    let g = file_batch_groups(&lines, 2, 1);
+    assert_eq!(g.len(), 2);
+    assert!(g.iter().all(|grp| grp.iter().flatten().all(|l| l.file == grp[0][0].file)), "never mixes files");
+    assert_eq!(g[0].iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2, 1]);
+    // One big file and four workers: four contiguous chapters, in order.
+    let one = mk("hcb", 16);
+    let g = file_batch_groups(&one, 2, 4);
+    assert_eq!(g.len(), 4);
+    let flat: Vec<String> = g.into_iter().flatten().flatten().map(|l| l.id).collect();
+    assert_eq!(flat, one.iter().map(|l| l.id.clone()).collect::<Vec<_>>());
+
+    // Two scripts, two requests at once, one line per request: each file runs
+    // in order, so every batch sees the English of the lines before it.
+    // (With more workers than files, files are split into chapters and a
+    // chapter's first batch can't wait for the one before it.)
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let factory = fake_with(Box::new(move |_s: &str, u: &str| {
+        if u.contains("TRANSLATE") {
+            s2.lock().unwrap().push(u.to_string());
+        }
+        None
+    }));
+    let pipe = pipeline(&e, &game, settings("quick", 1, 2), factory);
+    pipe.extract().unwrap();
+    pipe.translate(None, false).unwrap();
+    let msgs = seen.lock().unwrap().clone();
+    let with_ctx: Vec<&String> = msgs.iter().filter(|m| m.starts_with("CONTEXT")).collect();
+    assert!(!with_ctx.is_empty());
+    for m in &with_ctx {
+        let ctx = m.split("TRANSLATE").next().unwrap();
+        for l in ctx.lines().filter(|l| l.starts_with('{')) {
+            assert!(l.contains("\"en\""), "context without its English: {l}");
+        }
+    }
+    // The first line of the second script gets no context from the first.
+    let second_first = msgs.iter().find(|m| m.contains("じゃあ、一緒に行こう")).unwrap();
+    assert!(!second_first.starts_with("CONTEXT"), "{second_first}");
+
+    // Review shows the scene too, and only reviews what follows "REVIEW:".
+    let mut s = settings("recommended", 2, 2);
+    s.review = true;
+    let rseen: Arc<Mutex<Vec<String>>> = Default::default();
+    let r2 = rseen.clone();
+    let factory = fake_with(Box::new(move |_s: &str, u: &str| {
+        if u.contains("REVIEW:") {
+            r2.lock().unwrap().push(u.to_string());
+        }
+        None
+    }));
+    // Review batches hold 30 lines: a 35-line script gives a second batch.
+    let long_script: String = (0..35).map(|i| format!("{i}番目の台詞です。[p]\n")).collect();
+    let game2 = make_game(&tmp.path().join("g2"), &format!("*a\n{long_script}"));
+    let pipe = pipeline(&e, &game2, s, factory);
+    pipe.extract().unwrap();
+    pipe.translate(None, false).unwrap();
+    assert!(pipe.review(None).unwrap() > 0);
+    let r = rseen.lock().unwrap().clone();
+    assert!(r.iter().any(|m| m.starts_with("CONTEXT")), "{r:?}");
+    // The fake editor changes the first line under REVIEW, never a context line.
+    assert!(pipe.p.with_results(|res| res.values().any(|r| r.stage == "review")));
+
+    // Smart memory: a short spoken line is translated in each scene; a long
+    // repeated line still reuses its first translation.
+    let long = "今日は本当にいい天気ですね、そう思わない？";
+    let script = format!("*a\n「……うん」[p]\n「……うん」[p]\n「{long}」[p]\n「{long}」[p]\n");
+    for smart in [false, true] {
+        let dir = tmp.path().join(format!("smart{smart}"));
+        let game = make_game(&dir, &script);
+        let mut s = settings("quick", 50, 1);
+        s.smart_memory = smart;
+        let pipe = pipeline(&e, &game, s, fake().0);
+        pipe.extract().unwrap();
+        pipe.translate(None, false).unwrap();
+        let model_of = |needle: &str| -> Vec<String> {
+            pipe.live_lines()
+                .iter()
+                .filter(|l| l.jp.contains(needle) && l.file.contains("second"))
+                .map(|l| pipe.p.result(&l.id).unwrap().model.clone())
+                .collect()
+        };
+        let short_memory = model_of("うん").iter().filter(|m| *m == "memory").count();
+        assert_eq!(short_memory, if smart { 0 } else { 1 }, "smart_memory={smart}");
+        assert_eq!(model_of("いい天気").iter().filter(|m| *m == "memory").count(), 1);
+    }
+}
+
+#[test]
+fn character_cards_are_drafted_kept_and_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let s2 = seen.clone();
+    let a = translated_app(
+        tmp.path(),
+        fake_with(Box::new(move |s: &str, _u: &str| {
+            s2.lock().unwrap().push(s.to_string());
+            None
+        })),
+    );
+    // The user's own card for 大雅 exists before the draft.
+    call(
+        &a,
+        "save_style",
+        json!({"glossary": {"names": {}, "terms": [], "characters": [
+            {"jp": " 大雅 ", "en": "Taiga", "pronouns": "he/him", "voice": " Gruff, few words. ",
+             "address_rules": {"桜": "Sakura", " ": "dropped"}},
+            {"jp": "  ", "en": "nobody"}]}}),
+    );
+    call(&a, "run", json!({"action": "style"}));
+    let st = wait_job(&a);
+    assert!(st["job"]["error"].is_null(), "{}", st["job"]);
+    let g = call(&a, "get_style", json!({}))["glossary"].clone();
+    let cards = g["characters"].as_array().unwrap();
+    assert_eq!(cards.len(), 2, "{g}");
+    let taiga = cards.iter().find(|c| c["jp"] == "大雅").unwrap();
+    assert_eq!(taiga["voice"], "Gruff, few words.", "the user's card isn't overwritten");
+    assert_eq!(taiga["address_rules"].as_object().unwrap().len(), 1);
+    assert!(cards.iter().any(|c| c["jp"] == "桜" && c["pronouns"] == "she/her"));
+
+    // An older window that saves only names and terms keeps the cards.
+    call(&a, "save_style", json!({"glossary": {"names": {"桜": "Sakura"}, "terms": []}}));
+    assert_eq!(call(&a, "get_style", json!({}))["glossary"]["characters"].as_array().unwrap().len(), 2);
+
+    // Every translation request carries them.
+    seen.lock().unwrap().clear();
+    call(&a, "run", json!({"action": "translate"}));
+    wait_job(&a);
+    let sys = seen.lock().unwrap().clone();
+    assert!(sys.iter().any(|s| s.contains("Character voices & address rules:")
+        && s.contains("Taiga (大雅): he/him; Gruff, few words.; calls 桜 -> \"Sakura\"")));
+}
+
+#[test]
+fn diagnose_and_export_patch_zip() {
+    use std::io::Read;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = translated_app(tmp.path(), fake().0);
+    let d = call(&a, "diagnose", json!({}));
+    let text = d["text"].as_str().unwrap();
+    assert!(text.contains("msg-tool: MISSING"), "{text}");
+    assert!(text.contains("Engine: Kirikiri (KAG)"), "{text}");
+    let xp3 = d["game"]["entries"].as_array().unwrap().iter().find(|e| e["name"] == "data.xp3").unwrap().clone();
+    assert!(xp3["magic"].as_str().unwrap().starts_with("58 50 33 0d"), "{xp3}");
+    assert!(text.contains("data.xp3") && text.contains("Recent activity:"));
+
+    // Nothing built yet: said plainly.
+    let err = a.call("export_patch_zip", &json!({})).unwrap_err();
+    assert!(err.contains("Build the patch first"), "{err}");
+    call(&a, "run", json!({"action": "translate"}));
+    wait_job(&a);
+    call(&a, "run", json!({"action": "build"}));
+    let st = wait_job(&a);
+    assert!(st["job"]["error"].is_null(), "{}", st["job"]);
+    let r = call(&a, "export_patch_zip", json!({}));
+    let path = std::path::PathBuf::from(r["path"].as_str().unwrap());
+    assert!(path.file_name().unwrap().to_string_lossy().starts_with("g-en-patch-"));
+    let mut z = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+    let names: Vec<String> = (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_string()).collect();
+    assert!(names.contains(&"README-PATCH.txt".to_string()) && names.contains(&"patch.xp3".to_string()), "{names:?}");
+    let mut readme = String::new();
+    z.by_name("README-PATCH.txt").unwrap().read_to_string(&mut readme).unwrap();
+    assert!(readme.contains("Lines translated: 8 of 8") && readme.contains("patch.xp3"), "{readme}");
+    // The zip holds exactly what was installed.
+    let mut zipped = Vec::new();
+    z.by_name("patch.xp3").unwrap().read_to_end(&mut zipped).unwrap();
+    assert_eq!(zipped, fs::read(tmp.path().join("g/patch.xp3")).unwrap());
+}
+
+#[test]
+fn proportional_wrap_bilingual_render_and_balanced_json_parser() {
+    use yakusu_core::llm;
+    use yakusu_core::textfit::{self, text_cells, wrap, wrap_mode, TextBox};
+    // Narrow letters fit more per line in a proportional font.
+    let narrow = "it is still a little ill fitting if it fills this list";
+    let (_, mono) = wrap_mode(narrow, 20, "\n", false);
+    let (_, prop) = wrap_mode(narrow, 20, "\n", true);
+    assert!(prop < mono, "{prop} vs {mono}");
+    assert_eq!(wrap(narrow, 20, "\n"), wrap_mode(narrow, 20, "\n", false));
+    // A long word after other words is still broken to fit the box.
+    let (w, _) = wrap("a supercalifragilisticexpialidocious day", 10, "\n");
+    assert!(w.split('\n').all(|l| text_cells(l) <= 10), "{w}");
+    let b = TextBox { width: 20, lines: 2, proportional: true, ..Default::default() };
+    assert!(
+        textfit::fit(narrow, &b, "\n", true).1
+            < textfit::fit(narrow, &TextBox { proportional: false, ..b.clone() }, "\n", true).1
+    );
+    // Old project files without the field still load.
+    let old: TextBox = serde_json::from_str(r#"{"mode":"auto","width":40,"lines":3}"#).unwrap();
+    assert!(!old.proportional);
+
+    // Bilingual: the Japanese (without codes) under the English.
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(tmp.path());
+    let game = make_game(&tmp.path().join("g"), SECOND_KS);
+    let pipe = pipeline(&e, &game, settings("quick", 10, 1), fake().0);
+    pipe.extract().unwrap();
+    pipe.translate(None, false).unwrap();
+    let l = pipe.live_lines().into_iter().find(|l| l.jp.contains("今日から")).unwrap();
+    let r = pipe.p.result(&l.id).unwrap();
+    let (plain, _) = pipe.render(&pipe.render_ctx().unwrap(), &l, &r);
+    assert!(!plain.contains("今日から"));
+    pipe.p.update_meta(|m| m.settings.bilingual = true).unwrap();
+    let (both, _) = pipe.render(&pipe.render_ctx().unwrap(), &l, &r);
+    // Wrapped to the box like any text, after the English.
+    let jp_at = both.find("春の朝").unwrap();
+    assert!(
+        both.starts_with("The cherry") && both[jp_at..].replace("[r]", "").contains("今日から新しい学校に通う。"),
+        "{both}"
+    );
+    assert!(!both.contains('⟦'));
+
+    // A reply with brackets in the chatter around the array.
+    let reply = "Note [1]: fixed line [3] below.\n[{\"i\": 1, \"en\": \"a ] tricky [ line\"}]\nDone [ok].";
+    let v = llm::parse_json_array(reply).unwrap();
+    assert_eq!(v[0]["en"], "a ] tricky [ line");
+    assert_eq!(llm::parse_json_array("```json\n[{\"i\":2,\"en\":\"x\"}]\n```").unwrap()[0]["i"], 2);
+    assert!(llm::parse_json_array("no array here").is_err());
+    assert_eq!(llm::parse_json_array("see [2] and [3]").unwrap(), vec![json!(2)]);
+
+    // Models and prices.
+    assert_eq!(llm::price_of("gemini-3.8-flash"), Some([0.75, 3.75, 0.75, 0.75]));
+    assert_eq!(llm::price_of("gemini-4-argon").unwrap()[..2], [4.0, 20.0]);
+    assert_eq!(llm::price_of("claude-fable-5-2"), Some([8.0, 40.0, 10.0, 0.20]));
+    assert_eq!(llm::price_of("gemini-3.6-flash"), None, "retired Nov 19, 2026");
+    assert_eq!(llm::provider("gemini").models[0], "gemini-3.1-flash-lite");
+}

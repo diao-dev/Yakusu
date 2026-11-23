@@ -14,10 +14,15 @@ Return ONLY a JSON object:
                   how to handle sound effects, ellipses and stammering, and anything unusual in this script.
                   Concrete and short, 150-400 words.",
   "names": [{"jp": "speaker name as written", "en": "English name", "notes": "gender / role if clear"}],
-  "terms": [{"jp": "recurring term, place or invented word", "en": "rendering"}]
+  "terms": [{"jp": "recurring term, place or invented word", "en": "rendering"}],
+  "characters": [{"jp": "speaker name as written", "en": "English name", "pronouns": "she/her",
+                  "voice": "one or two sentences: register, verbal tics, how formal",
+                  "address_rules": {"other character's Japanese name": "how this character addresses them in English"}}]
 }
 Use the standard romanization (Hepburn, no macrons) for Japanese names unless the game itself
-shows a different spelling. Include EVERY speaker name from the list in "names"."#;
+shows a different spelling. Include EVERY speaker name from the list in "names".
+Give "characters" only for the main cast (up to 12), with address rules only where they matter
+(nicknames, "senpai", formal vs first name)."#;
 
 const TRANSLATE_SYSTEM: &str = r#"You are translating a Japanese visual novel into English for a game patch.
 Write natural, readable English that keeps the meaning, tone and each character's voice.
@@ -103,6 +108,35 @@ pub fn glossary_block(g: &Glossary) -> String {
         out.extend(
             g.terms.iter().filter(|t| !t.jp.is_empty() && !t.en.is_empty()).map(|t| format!("- {} -> {}", t.jp, t.en)),
         );
+    }
+    let cards: Vec<String> = g
+        .characters
+        .iter()
+        .filter(|c| !c.jp.trim().is_empty())
+        .map(|c| {
+            let name = if c.en.trim().is_empty() { c.jp.clone() } else { format!("{} ({})", c.en.trim(), c.jp.trim()) };
+            let mut parts = Vec::new();
+            if !c.pronouns.trim().is_empty() {
+                parts.push(c.pronouns.trim().to_string());
+            }
+            if !c.voice.trim().is_empty() {
+                parts.push(c.voice.trim().to_string());
+            }
+            let addr: Vec<String> = c
+                .address_rules
+                .iter()
+                .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+                .map(|(k, v)| format!("{} -> \"{}\"", k.trim(), v.trim()))
+                .collect();
+            if !addr.is_empty() {
+                parts.push(format!("calls {}", addr.join(", ")));
+            }
+            format!("- {name}: {}", parts.join("; "))
+        })
+        .collect();
+    if !cards.is_empty() {
+        out.push("Character voices & address rules:".into());
+        out.extend(cards);
     }
     out.join("\n")
 }

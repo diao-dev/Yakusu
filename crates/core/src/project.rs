@@ -138,11 +138,25 @@ pub struct Term {
     pub en: String,
 }
 
+/// How one character talks, so every batch keeps their voice: pronouns, register,
+/// and what they call the others (`address_rules`: who -> how they address them).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CharacterCard {
+    pub jp: String,
+    pub en: String,
+    pub pronouns: String,
+    pub voice: String,
+    pub address_rules: IndexMap<String, String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Glossary {
     pub names: IndexMap<String, String>,
     pub terms: Vec<Term>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub characters: Vec<CharacterCard>,
 }
 
 impl Glossary {
@@ -159,11 +173,13 @@ pub struct ProjSettings {
     pub insert_breaks: bool,
     /// Show the loaded reference translation to the model while translating.
     pub use_reference_in_prompt: bool,
+    /// Show the Japanese under the English in the game (for learners).
+    pub bilingual: bool,
 }
 
 impl Default for ProjSettings {
     fn default() -> Self {
-        ProjSettings { quotes: "auto".into(), insert_breaks: true, use_reference_in_prompt: true }
+        ProjSettings { quotes: "auto".into(), insert_breaks: true, use_reference_in_prompt: true, bilingual: false }
     }
 }
 

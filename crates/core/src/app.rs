@@ -266,6 +266,8 @@ impl App {
                 self.retranslate(ids)
             }
             "lint" => self.pipeline()?.lint(),
+            "diagnose" => Ok(self.diagnose()),
+            "export_patch_zip" => self.export_patch_zip(),
             "import_reference" => self.import_reference(s_arg(a, "text"), s_arg(a, "label")),
             "clear_reference" => {
                 self.need_project()?.clear_reference()?;
@@ -710,6 +712,9 @@ impl App {
         if let Some(v) = a.get("batch_api").and_then(Value::as_bool) {
             s.batch_api = v;
         }
+        if let Some(v) = a.get("smart_memory").and_then(Value::as_bool) {
+            s.smart_memory = v;
+        }
         let num =
             |k: &str| a.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
         if let Some(v) = num("budget_usd") {
@@ -783,6 +788,11 @@ impl App {
 
     fn set_box(&self, a: &Value) -> Result<Value> {
         let p = self.need_project()?;
+        // Only a change to the box itself marks it as set by hand (so a new
+        // read of the scripts doesn't measure it again).
+        let project_only = a
+            .as_object()
+            .is_some_and(|o| o.keys().all(|k| matches!(k.as_str(), "use_reference_in_prompt" | "bilingual")));
         p.update_meta(|m| {
             let mut b = m.text_box.clone().unwrap_or_default();
             if let Some(w) = a.get("width").and_then(Value::as_f64) {
@@ -791,8 +801,16 @@ impl App {
             if let Some(n) = a.get("lines").and_then(Value::as_f64) {
                 b.lines = (n as i64).clamp(1, 12) as usize;
             }
-            b.user_set = true;
-            m.text_box = Some(b);
+            if let Some(v) = a.get("proportional").and_then(Value::as_bool) {
+                b.proportional = v;
+            }
+            if !project_only {
+                b.user_set = true;
+                m.text_box = Some(b);
+            }
+            if let Some(v) = a.get("bilingual").and_then(Value::as_bool) {
+                m.settings.bilingual = v;
+            }
             if let Some(v) = a.get("insert_breaks").and_then(Value::as_bool) {
                 m.settings.insert_breaks = v;
             }
@@ -963,6 +981,28 @@ impl App {
         }
         if let Some(g) = a.get("glossary") {
             let mut gl: crate::project::Glossary = serde_json::from_value(g.clone()).unwrap_or_default();
+            // An older window that doesn't send character cards keeps them.
+            if g.get("characters").is_none() {
+                gl.characters = p.glossary().characters;
+            }
+            gl.characters = gl
+                .characters
+                .into_iter()
+                .filter(|c| !c.jp.trim().is_empty())
+                .map(|mut c| {
+                    c.jp = c.jp.trim().into();
+                    c.en = c.en.trim().into();
+                    c.pronouns = c.pronouns.trim().into();
+                    c.voice = c.voice.trim().into();
+                    c.address_rules = c
+                        .address_rules
+                        .into_iter()
+                        .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+                        .map(|(k, v)| (k.trim().into(), v.trim().into()))
+                        .collect();
+                    c
+                })
+                .collect();
             gl.names = gl
                 .names
                 .into_iter()
@@ -1323,6 +1363,203 @@ impl App {
         p.set_reference(map, label)?;
         self.log(&format!("Loaded a reference translation for {matched} of {} lines.", live.len()));
         Ok(json!({"matched": matched, "rows": rows, "unmatched": unmatched, "total": live.len()}))
+    }
+
+    /// Game Doctor: everything worth knowing when a game won't open, in one
+    /// report to read or paste into a bug report. Reads only; changes nothing.
+    fn diagnose(&self) -> Value {
+        let tool = |name: &str| self.env.tool_path(name).map(|p| p.to_string_lossy().to_string());
+        let msg_tool = tool("msg-tool").or_else(|| tool("msg_tool"));
+        let vntp = tool("VNTextPatch");
+        let dll = self.env.tools.join("kirikiri").join("version.dll");
+        let dll = dll.is_file().then(|| dll.to_string_lossy().to_string());
+        let project = self.project();
+        let (folder_note, matches) = {
+            let i = self.inner.lock().unwrap();
+            (i.folder_note.clone(), i.matches.clone())
+        };
+        let mut game = json!(null);
+        let mut entries_text = Vec::new();
+        if let Some(p) = &project {
+            let dir = p.game_dir();
+            let mut entries = Vec::new();
+            let (mut readonly, mut exes, mut count) = (0usize, 0usize, 0usize);
+            let mut listing: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir).into_iter().flatten().flatten().collect();
+            listing.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+            for e in listing {
+                count += 1;
+                let name = e.file_name().to_string_lossy().to_string();
+                let Ok(meta) = e.metadata() else { continue };
+                if meta.is_file() && meta.permissions().readonly() {
+                    readonly += 1;
+                }
+                if name.to_lowercase().ends_with(".exe") {
+                    exes += 1;
+                }
+                if entries.len() >= 60 {
+                    continue;
+                }
+                let magic = if meta.is_file() {
+                    use std::io::Read;
+                    let mut head = [0u8; 8];
+                    let n = std::fs::File::open(e.path()).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
+                    head[..n].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+                } else {
+                    String::new()
+                };
+                entries_text.push(if meta.is_dir() {
+                    format!("  {name}/")
+                } else {
+                    format!("  {name}  {} bytes  [{magic}]", meta.len())
+                });
+                entries.push(json!({"name": name, "dir": meta.is_dir(), "size": meta.len(), "magic": magic}));
+            }
+            let m = p.meta().clone();
+            game = json!({
+                "path": dir, "exists": dir.is_dir(), "entries": entries, "entry_count": count,
+                "readonly_files": readonly, "exe_count": exes,
+                "engine": m.engine.as_ref().map(|e| json!({"id": e.engine_id, "name": e.name, "details": e.details})),
+                "read": m.extracted_at.is_some(), "lines": m.stats.as_ref().map(|s| s.lines),
+            });
+        }
+        let job = self.job();
+        let logs: Vec<String> = self.logs().into_iter().rev().take(25).rev().map(|l| l.m).collect();
+        let yes = |v: &Option<String>| v.clone().unwrap_or_else(|| "MISSING".into());
+        let mut t = vec![
+            format!("Yakusu {} on {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+            format!("Tools folder: {}", self.env.tools.display()),
+            format!("msg-tool: {}", yes(&msg_tool)),
+            format!("VNTextPatch: {}", vntp.clone().unwrap_or_else(|| "missing (only needed for some engines)".into())),
+            format!(
+                "kirikiri/version.dll: {}",
+                dll.clone().unwrap_or_else(|| "missing (only needed for encrypted Kirikiri)".into())
+            ),
+        ];
+        match &project {
+            Some(_) => {
+                t.push(format!(
+                    "Game folder: {} ({})",
+                    game["path"].as_str().unwrap_or(""),
+                    if game["exists"] == true { "exists" } else { "NOT FOUND" }
+                ));
+                t.push(format!(
+                    "Engine: {}",
+                    game["engine"]["name"].as_str().map(String::from).unwrap_or_else(|| "not recognised".into())
+                ));
+                if !matches.is_empty() {
+                    t.push(format!(
+                        "Also matched: {}",
+                        matches.iter().map(|m| m.name.clone()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if let Some(n) = &folder_note {
+                    t.push(format!("Note: {n}"));
+                }
+                t.push(format!(
+                    "{} entries, {} .exe, {} read-only file(s){}",
+                    game["entry_count"],
+                    game["exe_count"],
+                    game["readonly_files"],
+                    if game["readonly_files"].as_u64().unwrap_or(0) > 0 {
+                        " (Yakusu clears this when it installs)"
+                    } else {
+                        ""
+                    }
+                ));
+                t.push("Files (first 8 bytes in hex):".into());
+                t.extend(entries_text);
+            }
+            None => t.push("No game is open.".into()),
+        }
+        if let Some(e) = &job.error {
+            t.push(format!("Last error ({}): {e}", job.action.clone().unwrap_or_default()));
+        }
+        t.push("Recent activity:".into());
+        t.extend(logs.iter().map(|l| format!("  {l}")));
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "tools_dir": self.env.tools,
+            "tools": {"msg-tool": msg_tool, "VNTextPatch": vntp, "version.dll": dll},
+            "game": game,
+            "folder_note": folder_note,
+            "last_error": job.error,
+            "logs": logs,
+            "text": t.join("\n"),
+        })
+    }
+
+    /// The built patch as one .zip to share: the files Yakusu installs (or,
+    /// for engines it can't repack, the patched scripts) and a README.
+    fn export_patch_zip(&self) -> Result<Value> {
+        use std::io::Write;
+        let p = self.need_project()?;
+        let m = p.meta().clone();
+        let manual = m.engine.as_ref().and_then(|e| e.str("manual_output")).map(PathBuf::from);
+        let out = p.work("out");
+        let (src, is_manual) = match engines::list_files(&out, None).is_empty() {
+            false => (out, false),
+            true => match manual.filter(|d| !engines::list_files(d, None).is_empty()) {
+                Some(d) => (d, true),
+                None => {
+                    return user("Build the patch first (Translate, or Apply on the Text box page), then export it.")
+                }
+            },
+        };
+        let files = engines::list_files(&src, None);
+        let game_dir = PathBuf::from(&m.game_dir);
+        let name = game_dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "game".into());
+        let engine = m.engine.as_ref().map(|e| e.name.clone()).unwrap_or_default();
+        let total = m.stats.as_ref().map(|s| s.lines).unwrap_or(0);
+        let done = p.with_results(|res| {
+            p.live_lines().iter().filter(|l| res.get(&l.id).is_some_and(|r| r.translated())).count()
+        });
+        let stamp = chrono::Local::now();
+        let mut readme = vec![
+            format!("English patch for {name}"),
+            format!("Made with Yakusu {} on {}.", env!("CARGO_PKG_VERSION"), stamp.format("%Y-%m-%d")),
+            format!("Engine: {engine}. Lines translated: {done} of {total}."),
+            String::new(),
+        ];
+        if is_manual {
+            readme.push("These are the game's script files with the English written in. This engine's archives can't be rebuilt automatically yet: pack them back with the engine's own tools.".into());
+        } else {
+            readme.extend([
+                "How to install:".to_string(),
+                "1. Back up the game folder, or at least the files listed below that it already has.".into(),
+                "2. Copy everything in this zip except this README into the game's folder (the one with its .exe), keeping the folders as they are. Replace files when asked.".into(),
+                "To remove it: put the backed-up files back (on Steam: Properties > Installed Files > Verify integrity) and delete the files the patch added.".into(),
+            ]);
+        }
+        readme.push(String::new());
+        readme.push("Files:".into());
+        readme.extend(files.iter().map(|f| format!("  {f}")));
+        let folder = p.path("exports");
+        std::fs::create_dir_all(&folder)?;
+        let slug: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect::<String>()
+            .trim_matches('_')
+            .chars()
+            .take(40)
+            .collect();
+        let slug = if slug.is_empty() { "game".to_string() } else { slug };
+        let path = folder.join(format!("{slug}-en-patch-{}.zip", stamp.format("%Y%m%d-%H%M%S")));
+        let zerr = |e: zip::result::ZipError| Error::User(format!("Couldn't write the zip: {e}"));
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        z.start_file("README-PATCH.txt", opts).map_err(zerr)?;
+        z.write_all(readme.join("\r\n").as_bytes())?;
+        for f in &files {
+            z.start_file(f.as_str(), opts).map_err(zerr)?;
+            let mut input = std::fs::File::open(engines::join_rel(&src, f))?;
+            std::io::copy(&mut input, &mut z)?;
+        }
+        z.finish().map_err(zerr)?;
+        self.log(&format!("Exported the patch to {}", path.display()));
+        let _ = (self.opener)(&folder);
+        Ok(json!({"path": path, "files": files.len()}))
     }
 
     fn launch(&self) -> Result<Value> {

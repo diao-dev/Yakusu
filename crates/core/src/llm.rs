@@ -16,10 +16,19 @@ pub const PRICES: &[(&str, [f64; 4])] = &[
     ("claude-haiku-5-5", [0.10, 0.50, 0.125, 0.01]),
     ("claude-sonnet-5-5", [2.00, 10.00, 2.50, 0.10]),
     ("claude-opus-5-5", [4.00, 20.00, 5.00, 0.20]),
+    // claude.com/pricing, Nov 2026.
+    ("claude-fable-5-2", [8.00, 40.00, 10.00, 0.20]),
     // Gemini (ai.google.dev/gemini-api/docs/pricing, Nov 2026). Newer models:
     // enter the price in Settings.
     ("gemini-3.1-flash-lite", [0.25, 1.50, 0.25, 0.25]),
     ("gemini-3.5-flash", [1.50, 9.00, 1.50, 1.50]),
+    // Introductory price until the end of 2026.
+    ("gemini-3.8-flash", [0.75, 3.75, 0.75, 0.75]),
+    // Up to 200k tokens per request.
+    ("gemini-3.1-pro-preview", [2.00, 12.00, 2.00, 2.00]),
+    // The price after the trial ($2 / $10) ends on Nov 30, 2026: a spending
+    // limit must never count low.
+    ("gemini-4-argon", [4.00, 20.00, 4.00, 4.00]),
     ("gemini-3-flash-preview", [0.50, 3.00, 0.50, 0.50]),
     ("gemini-2.5-flash", [0.30, 2.50, 0.30, 0.30]),
     ("gemini-2.5-flash-lite", [0.10, 0.40, 0.10, 0.10]),
@@ -76,7 +85,7 @@ pub const PROVIDERS: &[Provider] = &[
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         kind: "openai",
         // The first one is used when no model has been chosen.
-        models: &["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"],
+        models: &["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-4-argon"],
         key_hint: "AIza...",
         key_url: "https://aistudio.google.com/apikey",
     },
@@ -941,10 +950,55 @@ pub fn parse_json_array(text: &str) -> Result<Vec<Value>, String> {
         }
     }
     let (a, b) = (t.find('['), t.rfind(']'));
-    match (a, b) {
-        (Some(a), Some(b)) if b > a => serde_json::from_str::<Vec<Value>>(&t[a..=b]).map_err(|e| e.to_string()),
-        _ => Err("no JSON array in reply".into()),
+    let first_err = match (a, b) {
+        (Some(a), Some(b)) if b > a => match serde_json::from_str::<Vec<Value>>(&t[a..=b]) {
+            Ok(v) => return Ok(v),
+            Err(e) => e.to_string(),
+        },
+        _ => return Err("no JSON array in reply".into()),
+    };
+    // Commentary around the array can hold brackets of its own ("see [1]"):
+    // try each balanced [...] on its own, preferring one that holds objects.
+    let mut fallback = None;
+    for (start, _) in t.match_indices('[') {
+        let Some(end) = balanced_end(&t[start..]) else { continue };
+        if let Ok(v) = serde_json::from_str::<Vec<Value>>(&t[start..start + end]) {
+            if v.iter().any(Value::is_object) {
+                return Ok(v);
+            }
+            fallback.get_or_insert(v);
+        }
     }
+    fallback.ok_or(first_err)
+}
+
+/// Length of the balanced `[...]` at the start of `s` (strings and escapes
+/// respected), if it closes.
+fn balanced_end(s: &str) -> Option<usize> {
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    for (i, c) in s.char_indices() {
+        if in_str {
+            match c {
+                _ if esc => esc = false,
+                '\\' => esc = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' | '{' => depth += 1,
+            ']' | '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub mod fake {
@@ -997,7 +1051,9 @@ pub mod fake {
         }
         if system.starts_with("You are the lead translator") {
             return json!({"summary": "A gentle school romance.", "style_sheet": "- Past tense narration.",
-                "names": [{"jp": "桜", "en": "Sakura"}, {"jp": "大雅", "en": "Taiga"}], "terms": []})
+                "names": [{"jp": "桜", "en": "Sakura"}, {"jp": "大雅", "en": "Taiga"}], "terms": [],
+                "characters": [{"jp": "桜", "en": "Sakura", "pronouns": "she/her",
+                                "voice": "Cheerful, teasing, casual.", "address_rules": {"大雅": "Taiga"}}]})
             .to_string();
         }
         if system.starts_with("You give English names") {
@@ -1023,7 +1079,8 @@ pub mod fake {
                 .collect();
             return Value::Array(arr).to_string();
         }
-        let items = json_lines(user);
+        // Context lines (also JSON) come before the lines to work on.
+        let items = json_lines(user.split_once("REVIEW:").map_or(user, |x| x.1));
         if system.starts_with("You are a literary subtext critic") {
             // Flags the first line of each batch with a looser rewrite.
             return match items.first() {

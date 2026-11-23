@@ -7,9 +7,9 @@ use crate::config::{Env, Settings};
 use crate::engines::{self, list_files, read_json_messages, write_json_messages, Ctx, Engine, Installer};
 use crate::error::{setup, user, Error, Result};
 use crate::llm::{self, ClientFactory, Llm, LlmError};
-use crate::project::{now, Line, Project, ResultRow, Stats, Term};
+use crate::project::{now, CharacterCard, Line, Project, ResultRow, Stats, Term};
 use crate::prompts;
-use crate::protect::{check, foreign_codes, has_japanese, invented_codes, protect, restore, Protected};
+use crate::protect::{check, foreign_codes, has_japanese, invented_codes, protect, restore, strip_codes, Protected};
 use crate::textfit::{self, TextBox};
 use indexmap::IndexMap;
 use regex::Regex;
@@ -164,6 +164,8 @@ pub struct RenderCtx {
     pub quotes: String,
     pub insert_breaks: bool,
     pub names: IndexMap<String, String>,
+    /// Japanese shown under the English (see `ProjSettings::bilingual`).
+    pub bilingual: bool,
 }
 
 fn idx_of(v: &Value) -> Option<usize> {
@@ -199,6 +201,39 @@ fn jsonl<T: Serialize>(items: &[T]) -> String {
 
 fn chunks(lines: &[Line], n: usize) -> Vec<Vec<Line>> {
     lines.chunks(n.max(1)).map(|c| c.to_vec()).collect()
+}
+
+/// Batches of `n` lines that never mix script files, grouped by file in
+/// script order. Batches within a group run one after another, so each one
+/// sees the English of the lines just before it; groups run in parallel.
+/// With fewer files than `workers`, the biggest groups are split into
+/// contiguous blocks (chapters) so the work still runs side by side.
+pub fn file_batch_groups(lines: &[Line], n: usize, workers: usize) -> Vec<Vec<Vec<Line>>> {
+    let mut by_file: IndexMap<&str, Vec<Line>> = IndexMap::new();
+    for l in lines {
+        by_file.entry(l.file.as_str()).or_default().push(l.clone());
+    }
+    let mut groups: Vec<Vec<Vec<Line>>> = by_file.into_values().map(|ls| chunks(&ls, n)).collect();
+    while groups.len() < workers.max(1) {
+        let Some((at, _)) = groups.iter().enumerate().filter(|(_, g)| g.len() >= 2).max_by_key(|(_, g)| g.len()) else {
+            break;
+        };
+        let mut big = groups.remove(at);
+        let tail = big.split_off(big.len() / 2);
+        groups.insert(at, tail);
+        groups.insert(at, big);
+    }
+    groups
+}
+
+/// Up to `n` lines before `live[first]` from the same script file.
+fn same_file_ctx(live: &[Line], first: usize, n: usize) -> &[Line] {
+    let file = &live[first].file;
+    let mut start = first;
+    while start > first.saturating_sub(n) && live[start - 1].file == *file {
+        start -= 1;
+    }
+    &live[start..first]
 }
 
 /// Parse a JSON object out of a model reply.
@@ -324,6 +359,7 @@ impl Pipeline {
             quotes: meta.settings.quotes.clone(),
             insert_breaks: meta.settings.insert_breaks,
             names: self.p.glossary().names,
+            bilingual: meta.settings.bilingual,
         })
     }
 
@@ -776,6 +812,16 @@ impl Pipeline {
             }
         }
         g.terms = terms.into_values().collect();
+        // Character cards: new ones are added; a card the user already has
+        // (by its Japanese name) is never overwritten.
+        let have: HashSet<String> = g.characters.iter().map(|c| c.jp.trim().to_string()).collect();
+        for c in data.get("characters").and_then(Value::as_array).into_iter().flatten() {
+            let Ok(mut card) = serde_json::from_value::<CharacterCard>(c.clone()) else { continue };
+            card.jp = card.jp.trim().to_string();
+            if !card.jp.is_empty() && !have.contains(&card.jp) {
+                g.characters.push(card);
+            }
+        }
         self.p.set_glossary(g.clone())?;
         self.p.update_meta(|m| m.style_at = Some(now()))?;
         self.prog("style", 1, 1, "Style sheet ready");
@@ -879,7 +925,19 @@ impl Pipeline {
         let mut first: HashMap<(String, String), String> = HashMap::new(); // key -> id of first occurrence
         let mut reuse_now = Vec::new();
         let mut pending_copies: Vec<(&Line, String)> = Vec::new();
+        // Short spoken lines mean different things in different scenes:
+        // with smart memory they're translated in context every time.
+        // Noises and ellipses ("……") still reuse.
+        let fresh = |l: &Line| {
+            let pr = self.prot(&*eng, l);
+            let t = pr.text.trim();
+            self.s.smart_memory && has_japanese(t) && t.chars().count() < 12
+        };
         for l in todo {
+            if fresh(l) {
+                unique.push(l.clone());
+                continue;
+            }
             let k = key(l);
             if let Some(en) = known.get(&k) {
                 reuse_now.push(self.row(l, en, "memory", "translate", vec![]));
@@ -899,16 +957,17 @@ impl Pipeline {
             return Ok(reused);
         }
         let ctx_n = self.s.context_lines;
-        let batches = chunks(&unique, self.s.batch_size);
+        let groups = file_batch_groups(&unique, self.s.batch_size, self.workers());
         let total = unique.len();
         let done = AtomicUsize::new(0);
         // Batch API on, or a batch from an earlier run still to collect.
         if ids.is_none() && !redo && (self.batch_on(&*client) || self.batch_waiting() > 0) {
-            let reqs = batches
+            let reqs = groups
                 .iter()
+                .flatten()
                 .map(|batch| {
                     let first = index[batch[0].id.as_str()];
-                    let ctx = &live[first.saturating_sub(ctx_n)..first];
+                    let ctx = same_file_ctx(&live, first, ctx_n);
                     let prot: Vec<Arc<Protected>> = batch.iter().map(|l| self.prot(&*eng, l)).collect();
                     let (head, body, budget) = self.translate_request(batch, &prot, ctx, &names, &*eng, "");
                     llm::BatchRequest {
@@ -923,13 +982,18 @@ impl Pipeline {
         }
         let msg = format!("Translating with {tm}");
         self.prog("translate", 0, total, &msg);
-        self.run_parallel(batches, |batch| {
-            let first = index[batch[0].id.as_str()];
-            let ctx: Vec<Line> = live[first.saturating_sub(ctx_n)..first].to_vec();
-            let rows = self.translate_batch(&*client, &system, &batch, &ctx, &names, &*eng)?;
-            self.p.add_results(rows)?;
-            let d = done.fetch_add(batch.len(), Ordering::SeqCst) + batch.len();
-            self.prog("translate", d, total, &msg);
+        self.run_parallel(groups, |group| {
+            for batch in group {
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(Error::Cancelled);
+                }
+                let first = index[batch[0].id.as_str()];
+                let ctx: Vec<Line> = same_file_ctx(&live, first, ctx_n).to_vec();
+                let rows = self.translate_batch(&*client, &system, &batch, &ctx, &names, &*eng)?;
+                self.p.add_results(rows)?;
+                let d = done.fetch_add(batch.len(), Ordering::SeqCst) + batch.len();
+                self.prog("translate", d, total, &msg);
+            }
             Ok(())
         })?;
         let n_copies = pending_copies.len();
@@ -1167,16 +1231,22 @@ impl Pipeline {
         let total = todo.len();
         let done = AtomicUsize::new(0);
         let changed = AtomicUsize::new(0);
-        let batches = chunks(&todo, 30);
+        // Never across script files; the earlier lines of the same file are
+        // shown (read-only) so the editor knows the scene.
+        let batches: Vec<Vec<Line>> = file_batch_groups(&todo, 30, 1).into_iter().flatten().collect();
+        let index: HashMap<&str, usize> = live.iter().enumerate().map(|(k, l)| (l.id.as_str(), k)).collect();
+        let ctx_n = self.s.context_lines.min(8);
+        let ctx_for =
+            |batch: &[Line]| -> Vec<Line> { same_file_ctx(&live, index[batch[0].id.as_str()], ctx_n).to_vec() };
         if ids.is_none() && (self.batch_on(&*client) || self.batch_waiting() > 0) {
             let reqs = batches
                 .iter()
                 .map(|batch| {
-                    let (body, budget) = self.review_request(batch, &names, &*eng);
+                    let (head, body, budget) = self.review_request(batch, &ctx_for(batch), &names, &*eng);
                     llm::BatchRequest {
                         key: request_key("review", &rm, &system, &body, budget),
                         system: system.clone(),
-                        user: body,
+                        user: format!("{head}{body}"),
                         max_tokens: budget,
                     }
                 })
@@ -1185,7 +1255,7 @@ impl Pipeline {
         }
         self.prog("review", 0, total, format!("Reviewing with {rm}"));
         self.run_parallel(batches, |batch| {
-            let rows = self.review_batch(&*client, &system, &batch, &names, &*eng)?;
+            let rows = self.review_batch(&*client, &system, &batch, &ctx_for(&batch), &names, &*eng)?;
             let c = rows.iter().filter(|r| r.stage == "review").count();
             self.p.add_results(rows)?;
             let d = done.fetch_add(batch.len(), Ordering::SeqCst) + batch.len();
@@ -1197,8 +1267,30 @@ impl Pipeline {
         Ok(total)
     }
 
-    /// The user message for a review request and its token limit.
-    fn review_request(&self, batch: &[Line], names: &IndexMap<String, String>, eng: &dyn Engine) -> (String, u32) {
+    /// The user message for a review request: (context, the lines to review,
+    /// token limit). Only the second part identifies the request.
+    fn review_request(
+        &self,
+        batch: &[Line],
+        ctx: &[Line],
+        names: &IndexMap<String, String>,
+        eng: &dyn Engine,
+    ) -> (String, String, u32) {
+        let context: Vec<Value> = ctx
+            .iter()
+            .map(|l| {
+                let mut c = json!({"who": Self::who(l, names), "jp": self.prot(eng, l).text});
+                if let Some(r) = self.p.result(&l.id).filter(|r| r.translated()) {
+                    c["en"] = json!(r.en_ph);
+                }
+                c
+            })
+            .collect();
+        let head = if context.is_empty() {
+            String::new()
+        } else {
+            format!("CONTEXT (earlier lines, for reference only; do not review them):\n{}\n\n", jsonl(&context))
+        };
         let items: Vec<Value> = batch
             .iter()
             .map(|l| {
@@ -1210,7 +1302,7 @@ impl Pipeline {
             .collect();
         let en_chars: usize = items.iter().map(|i| i["en"].as_str().unwrap_or("").chars().count()).sum();
         let budget = en_chars + 40 * batch.len() + 400;
-        (jsonl(&items), budget.clamp(1500, 16000) as u32)
+        (head, format!("REVIEW:\n{}", jsonl(&items)), budget.clamp(1500, 16000) as u32)
     }
 
     fn review_batch(
@@ -1218,17 +1310,22 @@ impl Pipeline {
         client: &dyn Llm,
         system: &str,
         batch: &[Line],
+        ctx: &[Line],
         names: &IndexMap<String, String>,
         eng: &dyn Engine,
     ) -> Result<Vec<ResultRow>> {
         let prot: Vec<Arc<Protected>> = batch.iter().map(|l| self.prot(eng, l)).collect();
         let current: Vec<Arc<ResultRow>> = batch.iter().map(|l| self.p.result(&l.id).unwrap()).collect();
-        let (body, budget) = self.review_request(batch, names, eng);
-        let Some(arr) = self.call_array(client, "review", system, &body, budget)? else {
+        let (head, body, budget) = self.review_request(batch, ctx, names, eng);
+        let arr = match self.call_reply_keyed(client, "review", system, &format!("{head}{body}"), &body, budget)? {
+            Reply::Items(a) => Some(a),
+            Reply::Unusable | Reply::Refused => None,
+        };
+        let Some(arr) = arr else {
             if batch.len() > 1 {
                 let mid = batch.len() / 2;
-                let mut a = self.review_batch(client, system, &batch[..mid], names, eng)?;
-                a.extend(self.review_batch(client, system, &batch[mid..], names, eng)?);
+                let mut a = self.review_batch(client, system, &batch[..mid], ctx, names, eng)?;
+                a.extend(self.review_batch(client, system, &batch[mid..], ctx, names, eng)?);
                 return Ok(a);
             }
             return Ok(vec![]); // left unreviewed; a later review run picks it up
@@ -1259,7 +1356,16 @@ impl Pipeline {
     /// Final message text for one line, plus how many rows it overflows by.
     pub fn render(&self, rc: &RenderCtx, l: &Line, r: &ResultRow) -> (String, usize) {
         let lb = rc.eng.line_break_for(&l.file);
-        let text = self.restored(rc, l, r);
+        let mut text = self.restored(rc, l, r);
+        if rc.bilingual {
+            // The Japanese line under the English, without its codes (pauses
+            // and colours belong to the English part).
+            let jp = strip_codes(&protect(&l.jp, lb).text);
+            let jp = jp.trim();
+            if !jp.is_empty() {
+                text = format!("{text}{}{jp}", if lb.is_empty() { "\n" } else { lb });
+            }
+        }
         let text =
             textfit::normalize_encoding(&text, &rc.eng.encoding(), rc.eng.straight_quotes() && rc.quotes == "auto");
         textfit::fit(&text, &rc.text_box, lb, rc.insert_breaks)
@@ -1991,14 +2097,25 @@ impl Pipeline {
     }
 
     // ------------------------------------------------------------ runner
-    fn run_parallel<F>(&self, batches: Vec<Vec<Line>>, f: F) -> Result<()>
+    /// How many requests run at once (a local server takes one at a time).
+    fn workers(&self) -> usize {
+        if self.s.provider == "local" {
+            1
+        } else {
+            self.s.parallel.max(1)
+        }
+    }
+
+    /// Run `f` on each item, `workers()` at a time. Stops starting new items
+    /// once Stop is pressed or an item hits a fatal error.
+    fn run_parallel<T: Send, F>(&self, items: Vec<T>, f: F) -> Result<()>
     where
-        F: Fn(Vec<Line>) -> Result<()> + Sync,
+        F: Fn(T) -> Result<()> + Sync,
     {
-        let workers = if self.s.provider == "local" { 1 } else { self.s.parallel.max(1) };
+        let workers = self.workers();
         let next = AtomicUsize::new(0);
         let errors: Mutex<Vec<Error>> = Mutex::new(Vec::new());
-        let batches: Vec<Mutex<Option<Vec<Line>>>> = batches.into_iter().map(|b| Mutex::new(Some(b))).collect();
+        let batches: Vec<Mutex<Option<T>>> = items.into_iter().map(|b| Mutex::new(Some(b))).collect();
         std::thread::scope(|scope| {
             for _ in 0..workers.min(batches.len()) {
                 scope.spawn(|| loop {
