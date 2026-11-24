@@ -91,7 +91,7 @@ fn siglus_and_reallive_are_detected_by_their_own_markers() {
     std::fs::write(s.join("Scene.pck"), b"").unwrap();
     std::fs::write(s.join("Gameexe.dat"), b"").unwrap();
     let m = engines::detect(&s).unwrap();
-    assert_eq!((m[0].engine_id.as_str(), m[0].name.as_str()), ("unsupported", "SiglusEngine"));
+    assert_eq!((m[0].engine_id.as_str(), m[0].name.as_str()), ("siglus", "SiglusEngine"));
     let r = tmp.path().join("reallive");
     std::fs::create_dir_all(&r).unwrap();
     std::fs::write(r.join("Seen.txt"), b"").unwrap();

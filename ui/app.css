@@ -585,3 +585,6 @@ table.names input:placeholder-shown { border-color: var(--warn-bg); box-shadow: 
   .bar i, .job-fill { transition: none; }
 }
 table.names.chars input:placeholder-shown { border-color: var(--rule); box-shadow: none; }
+.title-pick .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+.title-pick .row .input { flex: 1 1 360px; }
+.input.mono, .note code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 13px; }

@@ -17,6 +17,7 @@
   let translatorOpen = false;   // the translator card is expanded by hand
   let keyStatus = null;         // { cls, text } under the API key field
   let titlePickOpen = false;    // choosing which Kirikiri game this is
+  let siglusKeyOpen = false;    // typing a SiglusEngine Scene.pck key
   const modelLists = {};        // provider -> model IDs it offers
 
   // Cards are rebuilt only when what they show changes, so a click is never
@@ -196,6 +197,9 @@
     } else if (need === 'title') {
       titlePickOpen = true;
       show('home');
+    } else if (need === 'siglus_key') {
+      siglusKeyOpen = true;
+      show('home');
     }
     toast(msg, true);
   }
@@ -302,6 +306,7 @@
     $('#gamePath').value = '';
     estimates = null;
     titlePickOpen = false;
+    siglusKeyOpen = false;
     $('#kept').replaceChildren();
     await refresh();
     show('home');
@@ -311,6 +316,7 @@
     await call('close');
     estimates = null;
     titlePickOpen = false;
+    siglusKeyOpen = false;
     translatorOpen = false;
     keyStatus = null;
     $('#kept').replaceChildren();
@@ -399,8 +405,9 @@
     const reading = j.running && j.action === 'extract';
     const readError = !j.running && j.action === 'extract' && j.error ? j.error : null;
     const needTitle = eng && eng.engine_id === 'kirikiri' && (titlePickOpen || (!j.running && j.need === 'title'));
+    const needKey = eng && eng.engine_id === 'siglus' && (siglusKeyOpen || (!j.running && j.need === 'siglus_key'));
     if (isTyping(box)) return;
-    if (!changed('game', [p.game_dir, eng, p.stats, p.box, p.extracted, S.matches, S.folder_note, reading, readError, needTitle, !!j.running])) return;
+    if (!changed('game', [p.game_dir, eng, p.stats, p.box, p.extracted, S.matches, S.folder_note, reading, readError, needTitle, needKey, !!j.running])) return;
     const card = h('div', { class: 'card detect' });
     const usable = eng && eng.engine_id !== 'unsupported';
     card.append(h('div', { class: 'detect-head' },
@@ -414,6 +421,12 @@
       card.append(h('p', { class: 'note', text: u ? u.note : (S.folder_note ||
         'Yakusu didn\'t recognise this game\'s engine. If you have its script files extracted (for example with GARbro), translate them directly.') }));
     }
+    if (needKey) {
+      card.append(siglusKeyCard(det.siglus_key, j.need === 'siglus_key' ? j.error : ''));
+    } else if (eng && eng.engine_id === 'siglus' && det.siglus_key) {
+      card.append(h('p', { class: 'note' }, 'Encrypted Scene.pck, opened with key ', h('code', { text: det.siglus_key }), '. ',
+        h('button', { class: 'btn btn-quiet', onclick: () => { siglusKeyOpen = true; render(); } }, 'Change key')));
+    }
     if (needTitle) {
       card.append(titlePicker(!!det.xp3_title));
     } else if (eng && eng.engine_id === 'kirikiri' && det.xp3_title) {
@@ -422,7 +435,7 @@
     }
     if (reading) {
       card.append(h('p', { class: 'note reading', role: 'status', text: 'Reading the scripts… this takes a moment for big games.' }));
-    } else if (readError && !needTitle) {
+    } else if (readError && !needTitle && !needKey) {
       card.append(h('div', { class: 'callout bad' }, h('b', { text: 'Couldn\'t read the scripts. ' }), readError,
         h('div', { class: 'callout-actions' },
           h('button', { class: 'btn btn-quiet', onclick: () => { show('activity'); runDoctor(); } }, 'Run Game Doctor'),
@@ -454,6 +467,25 @@
     }) }, 'Use extracted script files instead'));
     card.append(tools);
     box.replaceChildren(card);
+  }
+
+  // A SiglusEngine game whose Scene.pck key couldn't be found automatically.
+  function siglusKeyCard(current, why) {
+    const input = h('input', { class: 'input mono', type: 'text', value: current || '', spellcheck: 'false', autocomplete: 'off',
+      placeholder: 'Paste the 16-byte key, e.g. 36 0F C9 6E 2E D3 8B 0F 66 A5 70 C3 23 A3 6E 94', 'aria-label': 'Scene.pck key' });
+    const go = () => safe(async () => {
+      if (!input.value.trim()) { input.focus(); return; }
+      await call('engine', { siglus_key: input.value });
+      siglusKeyOpen = false;
+      toast('Reading the scripts with that key…');
+    });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+    return h('div', { class: 'title-pick' },
+      h('b', { text: current ? 'Use a different key' : 'This game\'s Scene.pck is encrypted' }),
+      h('p', { class: 'hint', text: why || 'Yakusu couldn\'t find its 16-byte key automatically. Paste it below (32 hex digits; spaces, commas and 0x are fine), or put a key.toml from SiglusExtract or siglus_rs in the game folder and read the scripts again.' }),
+      h('div', { class: 'row' }, input,
+        h('button', { class: 'btn btn-primary', onclick: go }, 'Read with this key'),
+        current ? h('button', { class: 'btn btn-quiet', onclick: () => { siglusKeyOpen = false; render(); } }, 'Cancel') : null));
   }
 
   function titlePicker(hasTitle) {
