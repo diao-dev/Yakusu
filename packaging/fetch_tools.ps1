@@ -38,5 +38,17 @@ if ($exe.DirectoryName -ne "$tools\VNTextPatch") { Get-ChildItem $exe.DirectoryN
 # 3. KirikiriUnencryptedArchive version.dll (arcusmaximus/KirikiriTools 1.7, MIT).
 Invoke-WebRequest 'https://github.com/arcusmaximus/KirikiriTools/releases/download/1.7/version.dll' -OutFile "$tools\kirikiri\version.dll"
 
+# 4. siglus-static-key-tool (xmoezzz/siglus_static_key_tool, MPL-2.0): recovers
+#    the 16-byte key an encrypted SiglusEngine Scene.pck needs, from
+#    Scene.pck + Gameexe.dat or from the game's .exe.
+$SIGLUSKEY_REF = 'd1bcd97862a24b511217e3ea930599ed99e0a053'
+if (-not (Test-Path "$tmp\siglus_static_key_tool\.git")) { git -c core.autocrlf=false clone https://github.com/xmoezzz/siglus_static_key_tool "$tmp\siglus_static_key_tool"; Check 'git clone siglus_static_key_tool' }
+Push-Location "$tmp\siglus_static_key_tool"
+git fetch origin; Check 'git fetch'
+git checkout --force $SIGLUSKEY_REF; Check 'git checkout'
+cargo build --release --locked; Check 'siglus-static-key-tool build'
+Copy-Item target\release\siglus-static-key-tool.exe "$tools\siglus-static-key-tool.exe" -Force
+Pop-Location
+
 Write-Host "Tools ready in $tools"
 Get-ChildItem $tools -Recurse -File | Select-Object FullName, Length

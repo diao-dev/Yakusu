@@ -21,6 +21,7 @@ pub mod manual;
 pub mod msgtool;
 pub mod rgss;
 pub mod rpgmaker;
+pub mod siglus;
 pub mod tyrano;
 pub mod unity;
 pub mod xp3;
@@ -173,10 +174,23 @@ pub fn detect(game_dir: &Path) -> Result<Vec<Match>> {
     if let Some(m) = unity::detect(game_dir) {
         matches.push(m);
     }
+    if let Some(m) = siglus::detect(game_dir) {
+        matches.push(m);
+    }
     for prof in generic::PROFILES {
         if let Some(m) = generic::detect_profile(game_dir, prof) {
             matches.push(m);
         }
+    }
+    // Circus packs are *.pck too: a SiglusEngine Scene.pck isn't one.
+    if matches.iter().any(|m| m.engine_id == "siglus") {
+        matches.retain(|m| {
+            m.engine_id != "circus"
+                || !m
+                    .strings("files")
+                    .iter()
+                    .all(|f| f.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case("Scene.pck")))
+        });
     }
     matches.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
     if matches.first().is_none_or(|m| m.confidence < 0.9) {
@@ -202,6 +216,7 @@ pub fn engine_for(m: &Match) -> Result<Box<dyn Engine>> {
         "rgss" => Ok(Box::new(rgss::Rgss { m: m.clone() })),
         "lcf" => Ok(Box::new(lcf::Lcf { m: m.clone() })),
         "unity" => Ok(Box::new(unity::Unity { m: m.clone() })),
+        "siglus" => Ok(Box::new(siglus::Siglus { m: m.clone() })),
         "scripts" => Ok(Box::new(manual::ScriptFolder { m: m.clone() })),
         id if generic::profile(id).is_some() => Ok(Box::new(generic::MsgToolEngine { m: m.clone() })),
         _ => Err(Error::User(format!("{} isn't supported. {}", m.name, m.note).trim().to_string())),

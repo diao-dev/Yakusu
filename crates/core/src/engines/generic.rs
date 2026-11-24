@@ -124,11 +124,6 @@ pub const PROFILES: &[Profile] = &[
 /// Engines we recognise but can't patch automatically, with what to do instead.
 const KNOWN_UNSUPPORTED: &[(&[&str], &str, &str)] = &[
     (
-        &["Scene.pck", "Gameexe.dat"],
-        "SiglusEngine",
-        "SiglusEngine isn't supported yet. No open tool can rebuild its Scene.pck reliably.",
-    ),
-    (
         &["Rio.arc", "Rio*.arc"],
         "WillPlus / AdvHD",
         "Extract the .ws2 scripts from Rio.arc with GARbro, then use \"Translate script files\" and point Yakusu at that folder.",
@@ -254,8 +249,8 @@ pub fn detect_profile(game_dir: &Path, prof: &Profile) -> Option<Match> {
     Some(Match::new(prof.id, prof.name, conf, d, prof.support, prof.note))
 }
 
-/// An unsupported engine whose every marker is present (e.g. SiglusEngine's
-/// Scene.pck *and* Gameexe.dat). Strong enough to outrank a loose archive glob.
+/// An unsupported engine whose every marker is present (e.g. RealLive's
+/// Seen.txt *and* Gameexe.ini). Strong enough to outrank a loose archive glob.
 pub fn detect_unsupported_strong(game_dir: &Path) -> Option<Match> {
     for (markers, name, note) in KNOWN_UNSUPPORTED {
         if markers.len() > 1 && markers.iter().all(|m| !glob(game_dir, &[m]).is_empty() || game_dir.join(m).is_dir()) {

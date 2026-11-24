@@ -4,6 +4,7 @@
 use std::path::Path;
 use yakusu_core::engines::livemaker::{self, lsb::Lsb, tpword::TpWord};
 use yakusu_core::engines::rgss::{archive as rgss_archive, marshal};
+use yakusu_core::engines::siglus::{lzss, pck, ss};
 use yakusu_core::engines::unity::serialized::SerializedFile;
 
 fn fixture(rel: &str) -> Vec<u8> {
@@ -150,6 +151,40 @@ fn rpg_maker_2000_never_panics() {
                     let _ = lcf::apply(&file, &es).map(|f| lcf::write_file(&f));
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn siglus_never_panics() {
+    let mut code = ss::asm::nl(1);
+    code.extend(ss::asm::name(0));
+    code.extend(ss::asm::text(1, 0));
+    code.push(ss::asm::SEL_START);
+    code.extend(ss::asm::push_str(2));
+    code.extend(ss::asm::command(&[20]));
+    code.push(ss::asm::SEL_END);
+    code.push(ss::asm::EOF);
+    let scene = ss::build(&code, &["桜", "おはよう。", "学校へ"], 1, true);
+    let key = [7u8; 16];
+    let packed = pck::build(&[("a".into(), scene.clone()), ("b".into(), scene.clone())], Some(&key), true);
+    for (n, m) in mutants(&scene, 3000, 11).into_iter().enumerate() {
+        if let Ok(s) = ss::Ss::parse_with(m, n % 2 == 0) {
+            let e = s.export();
+            let _ = s.apply(&e);
+            let _ = s.codec_scores();
+        }
+    }
+    for m in mutants(&lzss::pack(&scene), 3000, 12) {
+        let _ = lzss::unpack(&m);
+    }
+    for m in mutants(&packed, 3000, 13) {
+        if let Ok(p) = pck::Pck::parse(m) {
+            let _ = p.check_key(&key);
+            for i in 0..p.index.len() {
+                let _ = p.scene(i, Some(&key));
+            }
+            let _ = p.rewrite(&Default::default(), Some(&key));
         }
     }
 }

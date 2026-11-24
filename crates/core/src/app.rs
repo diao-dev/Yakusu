@@ -639,10 +639,22 @@ impl App {
         } else {
             None
         };
+        // A SiglusEngine key pasted in: any common spelling, stored as hex.
+        let siglus_key = match a.get("siglus_key").and_then(Value::as_str) {
+            Some(k) if !k.trim().is_empty() => match engines::siglus::key::parse_hex(k) {
+                Some(b) => Some(Value::from(engines::siglus::key::hex(&b))),
+                None => return user("That key isn't 16 bytes of hex (32 hex digits, like 36 0F C9 6E ...)."),
+            },
+            Some(_) => Some(Value::Null),
+            None => None,
+        };
         p.update_meta(|m| {
             if let Some(c) = chosen {
                 m.engine = Some(c);
                 m.hidden = false;
+            }
+            if let (Some(k), Some(e)) = (&siglus_key, m.engine.as_mut()) {
+                e.set("siglus_key", k.clone());
             }
             if let (Some(t), Some(e)) = (a.get("xp3_title"), m.engine.as_mut()) {
                 match t.as_str().filter(|s| !s.is_empty()) {
@@ -1371,6 +1383,7 @@ impl App {
         let tool = |name: &str| self.env.tool_path(name).map(|p| p.to_string_lossy().to_string());
         let msg_tool = tool("msg-tool").or_else(|| tool("msg_tool"));
         let vntp = tool("VNTextPatch");
+        let siglus_tool = tool("siglus-static-key-tool");
         let dll = self.env.tools.join("kirikiri").join("version.dll");
         let dll = dll.is_file().then(|| dll.to_string_lossy().to_string());
         let project = self.project();
@@ -1431,6 +1444,10 @@ impl App {
             format!("msg-tool: {}", yes(&msg_tool)),
             format!("VNTextPatch: {}", vntp.clone().unwrap_or_else(|| "missing (only needed for some engines)".into())),
             format!(
+                "siglus-static-key-tool: {}",
+                siglus_tool.clone().unwrap_or_else(|| "missing (only needed for encrypted SiglusEngine games)".into())
+            ),
+            format!(
                 "kirikiri/version.dll: {}",
                 dll.clone().unwrap_or_else(|| "missing (only needed for encrypted Kirikiri)".into())
             ),
@@ -1480,7 +1497,7 @@ impl App {
             "version": env!("CARGO_PKG_VERSION"),
             "platform": std::env::consts::OS,
             "tools_dir": self.env.tools,
-            "tools": {"msg-tool": msg_tool, "VNTextPatch": vntp, "version.dll": dll},
+            "tools": {"msg-tool": msg_tool, "VNTextPatch": vntp, "version.dll": dll, "siglus-static-key-tool": siglus_tool},
             "game": game,
             "folder_note": folder_note,
             "last_error": job.error,

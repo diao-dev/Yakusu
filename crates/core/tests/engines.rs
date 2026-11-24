@@ -131,13 +131,13 @@ fn script_folder_outside_game_is_manual() {
 #[test]
 fn unsupported_engines_are_explained() {
     let tmp = tempfile::tempdir().unwrap();
-    let game = tmp.path().join("Siglus");
+    let game = tmp.path().join("RealLive");
     std::fs::create_dir_all(&game).unwrap();
-    std::fs::write(game.join("Scene.pck"), b"").unwrap();
-    std::fs::write(game.join("Gameexe.dat"), b"").unwrap();
+    std::fs::write(game.join("Seen.txt"), b"").unwrap();
+    std::fs::write(game.join("Gameexe.ini"), b"").unwrap();
     let m = engines::detect(&game).unwrap();
     assert_eq!(m[0].engine_id, "unsupported");
-    assert!(m[0].note.contains("SiglusEngine"));
+    assert!(m[0].note.contains("Seen.txt"));
     assert!(engines::engine_for(&m[0]).is_err());
     assert!(engines::detect(&tmp.path().join("nope")).is_err());
 }
